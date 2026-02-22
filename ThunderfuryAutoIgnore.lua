@@ -220,25 +220,24 @@ end
 
 -- ---------------------------------------------------------------------------
 -- Sync the account-wide DB to this character's game ignore list.
--- Called on every login / PLAYER_ENTERING_WORLD so that every alt gets
--- the same ignore list applied.  Also removes anyone from the game's
--- ignore list who is NOT in the addon DB (or whose entry expired).
+-- All operations are immediate (no staggering).  A ShowFriends() call
+-- at the end nudges the client to refresh the social data.
 -- ---------------------------------------------------------------------------
 local function SyncIgnoreList()
+    -- 1.  Clean expired entries out of the addon DB
     CleanIgnoreList()
 
-    -- Build a lowercase lookup of names still in the addon DB
+    -- 2.  Build a lowercase lookup of names that should be ignored
     local dbLookup = {}
     for name, _ in pairs(ThunderfuryAutoIgnoreDB.ignoredPlayers or {}) do
         dbLookup[string.lower(name)] = true
     end
 
-    -- Walk the game's ignore list and remove anyone not in the DB
+    -- 3.  Remove game-side ignores that are NOT in the DB (stale)
     local numIgnored = C_FriendList and C_FriendList.GetNumIgnores and
                            C_FriendList.GetNumIgnores() or
                            (GetNumIgnores and GetNumIgnores()) or 0
-    local toUnignore = {}
-    for i = 1, numIgnored do
+    for i = numIgnored, 1, -1 do -- iterate backwards so indices stay valid
         local ignoreName
         if C_FriendList and C_FriendList.GetIgnoreName then
             ignoreName = C_FriendList.GetIgnoreName(i)
@@ -247,21 +246,26 @@ local function SyncIgnoreList()
         end
         if ignoreName and ignoreName ~= "" then
             if not dbLookup[string.lower(ignoreName)] then
-                table.insert(toUnignore, ignoreName)
+                SafeDelIgnore(ignoreName)
+                print("|cffff8c00TFA:|r Removed stale ignore: " .. ignoreName)
             end
         end
     end
-    for _, name in ipairs(toUnignore) do
-        SafeDelIgnore(name)
-        print("|cffff8c00TFA:|r Removed stale ignore: " .. name)
-    end
 
-    -- Re-apply every DB entry to this character's game list
+    -- 4.  Re-apply every DB entry to this character's game list
     local count = 0
     for name, _ in pairs(ThunderfuryAutoIgnoreDB.ignoredPlayers or {}) do
         SafeAddIgnore(name)
         count = count + 1
     end
+
+    -- 5.  Poke the social system so the client refreshes its ignore list
+    if C_FriendList and C_FriendList.ShowFriends then
+        C_FriendList.ShowFriends()
+    elseif ShowFriends then
+        ShowFriends()
+    end
+
     if count > 0 then
         print("|cffff8c00TFA:|r Synced " .. count ..
                   " ignored player(s) to this character")
@@ -373,9 +377,23 @@ f:SetScript("OnEvent", function(self, event, ...)
         f:UnregisterEvent("VARIABLES_LOADED")
 
     elseif event == "PLAYER_ENTERING_WORLD" then
-        -- Re-apply every non-expired ignore to this character's game list
-        SyncIgnoreList()
         RegisterEvents()
+
+        -- On fresh login the ignore list arrives from the server a few
+        -- seconds after PLAYER_ENTERING_WORLD.  Listen for the first
+        -- IGNORELIST_UPDATE (the signal that the data is ready), with a
+        -- 15-second safety net in case the event never fires.
+        local synced = false
+        local function DoSync()
+            if synced then return end
+            synced = true
+            f:UnregisterEvent("IGNORELIST_UPDATE")
+            SyncIgnoreList()
+        end
+        f._pendingSync = DoSync
+        f:RegisterEvent("IGNORELIST_UPDATE")
+
+        if C_Timer and C_Timer.After then C_Timer.After(15, DoSync) end
 
         -- Periodic cleanup every 5 minutes
         if C_Timer and C_Timer.NewTicker then
@@ -383,6 +401,18 @@ f:SetScript("OnEvent", function(self, event, ...)
         end
 
         f:UnregisterEvent("PLAYER_ENTERING_WORLD")
+
+    elseif event == "IGNORELIST_UPDATE" then
+        if f._pendingSync then
+            -- Small delay to let the client finish processing the data
+            local fn = f._pendingSync
+            f._pendingSync = nil
+            if C_Timer and C_Timer.After then
+                C_Timer.After(1, fn)
+            else
+                fn()
+            end
+        end
 
     elseif (ThunderfuryAutoIgnoreDB.settings or {}).enabled then
         local msg, author = ...
@@ -676,6 +706,7 @@ SlashCmdList["THUNDERFURYAUTOIGNORE"] = function(cmd)
     command = command or cmd
 
     if command == "" then
+        SyncIgnoreList()
         UpdateIgnoreList()
         ignoreFrame:Show()
 
@@ -755,6 +786,7 @@ local tfaLDB = LDB:NewDataObject("ThunderfuryAutoIgnore", {
             if ignoreFrame:IsShown() then
                 ignoreFrame:Hide()
             else
+                SyncIgnoreList()
                 UpdateIgnoreList()
                 ignoreFrame:Show()
             end
