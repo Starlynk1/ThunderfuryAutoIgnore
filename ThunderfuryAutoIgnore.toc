@@ -1,0 +1,13 @@
+## Interface: 11404
+## Title: Thunderfury Auto Ignore
+## Notes: Automatically ignores players who say 'Thunderfury, Blessed Blade of the Windseeker'.
+## Author: @Starlynk1, @Grok
+## SavedVariables: ThunderfuryAutoIgnoreDB
+## Category: Chat
+
+Libs\LibStub.lua
+Libs\CallbackHandler-1.0.lua
+Libs\LibDataBroker-1.1.lua
+Libs\LibDBIcon-1.0.lua
+
+ThunderfuryAutoIgnore.lua
