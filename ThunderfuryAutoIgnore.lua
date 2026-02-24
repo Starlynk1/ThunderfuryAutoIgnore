@@ -24,6 +24,31 @@ ThunderfuryAutoIgnoreDB.settings = ThunderfuryAutoIgnoreDB.settings or {
 local debugMode = false
 
 -- ---------------------------------------------------------------------------
+-- Locale-aware date/time formatting
+-- US realms use 12-hour AM/PM; all others use 24-hour format.
+-- ---------------------------------------------------------------------------
+local function IsUSRegion()
+    -- GetCurrentRegion(): 1=US, 2=KR, 3=EU, 4=TW, 5=CN
+    if GetCurrentRegion then return GetCurrentRegion() == 1 end
+    local portal = GetCVar and GetCVar("portal") or ""
+    return portal == "US"
+end
+
+local function FormatDateTime(ts)
+    if IsUSRegion() then
+        local h = tonumber(date("%H", ts))
+        local m = date("%M", ts)
+        local ampm = h >= 12 and "PM" or "AM"
+        h = h % 12
+        if h == 0 then h = 12 end
+        return date("%m/%d/%Y", ts) .. " (" .. h .. ":" .. m .. " " .. ampm ..
+                   ")"
+    else
+        return date("%Y-%m-%d (%H:%M)", ts)
+    end
+end
+
+-- ---------------------------------------------------------------------------
 -- Compatibility wrappers for the ignore API
 -- Classic Anniversary exposes C_FriendList; older builds use globals.
 -- Using the explicit Add/Del functions instead of the /ignore toggle
@@ -66,24 +91,15 @@ local ignoreFrame = CreateFrame("Frame", "ThunderfuryAutoIgnoreFrame", UIParent,
                                 "BackdropTemplate")
 ignoreFrame:SetSize(300, 268)
 ignoreFrame:SetPoint("CENTER")
+ignoreFrame:SetClampedToScreen(true)
 ignoreFrame:SetMovable(true)
 ignoreFrame:EnableMouse(true)
-ignoreFrame:EnableKeyboard(true)
 ignoreFrame:RegisterForDrag("LeftButton")
 ignoreFrame:SetScript("OnDragStart", ignoreFrame.StartMoving)
 ignoreFrame:SetScript("OnDragStop", ignoreFrame.StopMovingOrSizing)
-ignoreFrame:SetScript("OnShow", function(self)
-    SetOverrideBinding(self, false, "ESCAPE", nil)
-end)
-ignoreFrame:SetScript("OnHide", function(self) ClearOverrideBindings(self) end)
-ignoreFrame:SetScript("OnKeyDown", function(self, key)
-    if key == "ESCAPE" then
-        self:SetPropagateKeyboardInput(false)
-        self:Hide()
-    else
-        self:SetPropagateKeyboardInput(true)
-    end
-end)
+
+-- Allow ESC to close without stealing keyboard input from the game
+tinsert(UISpecialFrames, "ThunderfuryAutoIgnoreFrame")
 ignoreFrame:SetBackdrop({
     bgFile = "Interface\\Buttons\\WHITE8X8",
     edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
@@ -211,11 +227,142 @@ local function CleanIgnoreList()
         end
     end
     for _, name in ipairs(toRemove) do
+        local data = ThunderfuryAutoIgnoreDB.ignoredPlayers[name]
+        local ignoredAt = data and FormatDateTime(data.timestamp) or "?"
         SafeDelIgnore(name)
         ThunderfuryAutoIgnoreDB.ignoredPlayers[name] = nil
-        print("|cffff8c00TFA:|r Auto-unignored " .. name .. " (" .. days ..
-                  " day expiry)")
+        print("|cffff8c00TFA:|r Auto-unignored " .. name .. " (ignored " ..
+                  ignoredAt .. ", " .. days .. "-day / " .. (days * 24) ..
+                  "hr expiry)")
     end
+end
+
+-- ---------------------------------------------------------------------------
+-- Verify permanent ignores  (/tfa verify)
+-- Stagger-checks each permanent ignore by temporarily removing and re-adding
+-- it.  If the server responds with "player not found", the entry is flagged.
+-- ---------------------------------------------------------------------------
+local verifyState = nil -- nil when idle, table when running
+
+local function VerifyNextIgnore()
+    if not verifyState then return end
+    local idx = verifyState.idx
+    local names = verifyState.names
+
+    if idx > #names then
+        -- Finished
+        local flagged = verifyState.flagged
+        if #flagged > 0 then
+            print("|cffff8c00TFA Verify:|r " .. #flagged ..
+                      " permanent ignore(s) may no longer exist:")
+            for _, n in ipairs(flagged) do
+                print("  |cffff4444-|r " .. n)
+            end
+            print("|cffff8c00TFA:|r Use '/tfa remove Name' to remove them, " ..
+                      "or they may just be offline/renamed.")
+        else
+            print("|cffff8c00TFA Verify:|r All " .. #names ..
+                      " permanent ignore(s) appear valid.")
+        end
+        -- Unregister the system message listener
+        verifyState.frame:UnregisterEvent("CHAT_MSG_SYSTEM")
+        verifyState = nil
+        return
+    end
+
+    local name = names[idx]
+    verifyState.currentName = name
+    verifyState.waitingForResponse = true
+
+    -- Strip realm suffix — the game ignore API uses name-only on Classic
+    local nameOnly = name:match("^([^%-]+)") or name
+
+    -- The player is already on the ignore list.  Remove then re-add to
+    -- trigger a server response we can inspect.
+    SafeDelIgnore(nameOnly)
+
+    -- Small delay before re-adding so the server processes the removal
+    C_Timer.After(0.5, function()
+        if not verifyState then return end
+        SafeAddIgnore(nameOnly)
+        -- Give the server time to respond; if no error after 2s, assume valid
+        C_Timer.After(2, function()
+            if not verifyState then return end
+            if verifyState.waitingForResponse then
+                -- No error received — player exists
+                verifyState.waitingForResponse = false
+                verifyState.idx = verifyState.idx + 1
+                print("|cffff8c00TFA Verify:|r " .. name .. " — OK (" ..
+                          verifyState.idx - 1 .. "/" .. #names .. ")")
+                VerifyNextIgnore()
+            end
+        end)
+    end)
+end
+
+local function StartVerify()
+    if verifyState then
+        print("|cffff8c00TFA:|r Verify already in progress.")
+        return
+    end
+
+    local names = {}
+    for name, data in pairs(ThunderfuryAutoIgnoreDB.ignoredPlayers or {}) do
+        if data.permanent then table.insert(names, name) end
+    end
+
+    if #names == 0 then
+        print("|cffff8c00TFA:|r No permanent ignores to verify.")
+        return
+    end
+
+    print("|cffff8c00TFA Verify:|r Checking " .. #names ..
+              " permanent ignore(s)... this takes ~3s each.")
+
+    -- Create a temporary frame to listen for system messages
+    local listener = CreateFrame("Frame")
+    verifyState = {
+        names = names,
+        idx = 1,
+        flagged = {},
+        currentName = nil,
+        waitingForResponse = false,
+        frame = listener
+    }
+
+    -- Listen for "player not found" type responses
+    listener:RegisterEvent("CHAT_MSG_SYSTEM")
+    listener:SetScript("OnEvent", function(_, event, msg)
+        if not verifyState or not verifyState.waitingForResponse then
+            return
+        end
+
+        -- Match common error strings for non-existent players
+        local lowerMsg = string.lower(msg)
+        if lowerMsg:find("player not found") or lowerMsg:find("not found") or
+            lowerMsg:find("doesn't exist") or lowerMsg:find("unknown player") then
+            local name = verifyState.currentName
+            table.insert(verifyState.flagged, name)
+            print("|cffff8c00TFA Verify:|r " .. name ..
+                      " — |cffff4444NOT FOUND|r (" .. verifyState.idx .. "/" ..
+                      #verifyState.names .. ")")
+            verifyState.waitingForResponse = false
+            verifyState.idx = verifyState.idx + 1
+            VerifyNextIgnore()
+        elseif lowerMsg:find("now ignoring") or
+            lowerMsg:find("is already being ignored") or
+            lowerMsg:find("already on your ignore") then
+            -- Player exists
+            local name = verifyState.currentName
+            verifyState.waitingForResponse = false
+            verifyState.idx = verifyState.idx + 1
+            print("|cffff8c00TFA Verify:|r " .. name .. " — OK (" ..
+                      verifyState.idx - 1 .. "/" .. #verifyState.names .. ")")
+            VerifyNextIgnore()
+        end
+    end)
+
+    VerifyNextIgnore()
 end
 
 -- ---------------------------------------------------------------------------
@@ -227,17 +374,14 @@ local function SyncIgnoreList()
     -- 1.  Clean expired entries out of the addon DB
     CleanIgnoreList()
 
-    -- 2.  Build a lowercase lookup of names that should be ignored
-    local dbLookup = {}
-    for name, _ in pairs(ThunderfuryAutoIgnoreDB.ignoredPlayers or {}) do
-        dbLookup[string.lower(name)] = true
-    end
-
-    -- 3.  Remove game-side ignores that are NOT in the DB (stale)
+    -- 2.  Build a lowercase lookup of names already on the game ignore list
+    --     The game may return names with or without a realm suffix, so we
+    --     store both the full name and the name-only (before the hyphen).
+    local gameIgnoreLookup = {}
     local numIgnored = C_FriendList and C_FriendList.GetNumIgnores and
                            C_FriendList.GetNumIgnores() or
                            (GetNumIgnores and GetNumIgnores()) or 0
-    for i = numIgnored, 1, -1 do -- iterate backwards so indices stay valid
+    for i = 1, numIgnored do
         local ignoreName
         if C_FriendList and C_FriendList.GetIgnoreName then
             ignoreName = C_FriendList.GetIgnoreName(i)
@@ -245,30 +389,50 @@ local function SyncIgnoreList()
             ignoreName = GetIgnoreName(i)
         end
         if ignoreName and ignoreName ~= "" then
-            if not dbLookup[string.lower(ignoreName)] then
-                SafeDelIgnore(ignoreName)
-                print("|cffff8c00TFA:|r Removed stale ignore: " .. ignoreName)
-            end
+            local lower = string.lower(ignoreName)
+            gameIgnoreLookup[lower] = true
+            -- Also store the name-only portion (strip realm)
+            local nameOnly = lower:match("^([^%-]+)")
+            if nameOnly then gameIgnoreLookup[nameOnly] = true end
         end
     end
 
-    -- 4.  Re-apply every DB entry to this character's game list
-    local count = 0
-    for name, _ in pairs(ThunderfuryAutoIgnoreDB.ignoredPlayers or {}) do
-        SafeAddIgnore(name)
-        count = count + 1
+    -- Helper: check if a DB name matches any game ignore entry.
+    -- Compares both the full "Name-Realm" and just "Name".
+    local function IsAlreadyIgnored(dbName)
+        local lower = string.lower(dbName)
+        if gameIgnoreLookup[lower] then return true end
+        local nameOnly = lower:match("^([^%-]+)")
+        if nameOnly and gameIgnoreLookup[nameOnly] then return true end
+        return false
     end
 
-    -- 5.  Poke the social system so the client refreshes its ignore list
+    -- 3.  Add only DB entries that are missing from the game ignore list
+    local added = 0
+    for name, _ in pairs(ThunderfuryAutoIgnoreDB.ignoredPlayers or {}) do
+        if not IsAlreadyIgnored(name) then
+            SafeAddIgnore(name)
+            added = added + 1
+        end
+    end
+
+    -- 4.  Poke the social system so the client refreshes its ignore list
     if C_FriendList and C_FriendList.ShowFriends then
         C_FriendList.ShowFriends()
     elseif ShowFriends then
         ShowFriends()
     end
 
-    if count > 0 then
-        print("|cffff8c00TFA:|r Synced " .. count ..
-                  " ignored player(s) to this character")
+    local total = 0
+    for _ in pairs(ThunderfuryAutoIgnoreDB.ignoredPlayers or {}) do
+        total = total + 1
+    end
+    if added > 0 then
+        print("|cffff8c00TFA:|r Added " .. added .. " missing ignore(s) — " ..
+                  total .. " total tracked")
+    elseif total > 0 then
+        print("|cffff8c00TFA:|r Ignore list in sync — " .. total ..
+                  " player(s) tracked")
     end
 end
 
@@ -335,8 +499,39 @@ local function UpdateIgnoreList()
         local displayName = name:match("^([^%-]+)") or name
         line.nameText:SetText(prefix .. displayName)
         local dateStr = date("%Y-%m-%d", data.timestamp)
-        local suffix = data.permanent and " perm" or ""
-        line.dateText:SetText("(" .. dateStr .. suffix .. ")")
+        line.dateText:SetText("(" .. dateStr .. ")")
+
+        -- Tooltip with exact timestamp and expiry details
+        line:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:AddLine(name, 1, 0.8, 0)
+            GameTooltip:AddLine(
+                "Ignored on: " .. FormatDateTime(data.timestamp), 1, 1, 1)
+            if data.permanent then
+                GameTooltip:AddLine("Permanent – will not expire", 0.6, 0.6,
+                                    0.6)
+            else
+                local settings = ThunderfuryAutoIgnoreDB.settings or {}
+                local days = math.max(1, settings.ignoreDays or 1)
+                local expiresAt = data.timestamp + days * 86400
+                local remaining = expiresAt - time()
+                GameTooltip:AddLine("Expires: " .. FormatDateTime(expiresAt), 1,
+                                    1, 1)
+                if remaining > 0 then
+                    local hrs = math.floor(remaining / 3600)
+                    local mins = math.floor((remaining % 3600) / 60)
+                    GameTooltip:AddLine(
+                        string.format("Remaining: %dh %dm", hrs, mins), 0.5, 1,
+                        0.5)
+                else
+                    GameTooltip:AddLine("Expired – pending removal", 1, 0.3,
+                                        0.3)
+                end
+            end
+            GameTooltip:AddLine("Click to manage", 0.5, 0.5, 0.5)
+            GameTooltip:Show()
+        end)
+        line:SetScript("OnLeave", function() GameTooltip:Hide() end)
         yOffset = yOffset - 20
     end
     content:SetHeight(math.max(1, -yOffset))
@@ -380,19 +575,47 @@ f:SetScript("OnEvent", function(self, event, ...)
         RegisterEvents()
 
         -- On fresh login the ignore list arrives from the server a few
-        -- seconds after PLAYER_ENTERING_WORLD.  Listen for the first
-        -- IGNORELIST_UPDATE (the signal that the data is ready), with a
-        -- 15-second safety net in case the event never fires.
+        -- seconds after PLAYER_ENTERING_WORLD.  We wait for
+        -- IGNORELIST_UPDATE so the game ignore list is populated before
+        -- we attempt to diff it against our DB.  A 15-second safety net
+        -- handles the case where the event never fires.
         local synced = false
+        local ignoreListReady = false
+
         local function DoSync()
             if synced then return end
             synced = true
             f:UnregisterEvent("IGNORELIST_UPDATE")
             SyncIgnoreList()
         end
-        f._pendingSync = DoSync
+
+        -- Mark that we've seen at least one IGNORELIST_UPDATE with data,
+        -- then sync after a short settle delay so the client is stable.
+        local function OnIgnoreListReady()
+            if synced then return end
+            local numIgnored = C_FriendList and C_FriendList.GetNumIgnores and
+                                   C_FriendList.GetNumIgnores() or
+                                   (GetNumIgnores and GetNumIgnores()) or 0
+            -- If the game list has entries (or the DB is empty), it's ready
+            local dbCount = 0
+            for _ in pairs(ThunderfuryAutoIgnoreDB.ignoredPlayers or {}) do
+                dbCount = dbCount + 1
+            end
+            if numIgnored > 0 or dbCount == 0 then
+                ignoreListReady = true
+                if C_Timer and C_Timer.After then
+                    C_Timer.After(0.5, DoSync)
+                else
+                    DoSync()
+                end
+            end
+            -- else: list not loaded yet, wait for next IGNORELIST_UPDATE
+        end
+
+        f._pendingSync = OnIgnoreListReady
         f:RegisterEvent("IGNORELIST_UPDATE")
 
+        -- Safety net: if the event never fires or never has data, sync anyway
         if C_Timer and C_Timer.After then C_Timer.After(15, DoSync) end
 
         -- Periodic cleanup every 5 minutes
@@ -404,14 +627,9 @@ f:SetScript("OnEvent", function(self, event, ...)
 
     elseif event == "IGNORELIST_UPDATE" then
         if f._pendingSync then
-            -- Small delay to let the client finish processing the data
-            local fn = f._pendingSync
-            f._pendingSync = nil
-            if C_Timer and C_Timer.After then
-                C_Timer.After(1, fn)
-            else
-                fn()
-            end
+            -- Call the readiness check; it stays registered until it
+            -- confirms the list is populated (or the safety timer fires).
+            f._pendingSync()
         end
 
     elseif (ThunderfuryAutoIgnoreDB.settings or {}).enabled then
@@ -755,15 +973,41 @@ SlashCmdList["THUNDERFURYAUTOIGNORE"] = function(cmd)
     elseif command == "sync" then
         SyncIgnoreList()
 
+    elseif command == "verify" then
+        StartVerify()
+
+    elseif command == "remove" and arg ~= "" then
+        local targetName = arg:gsub("^%l", string.upper)
+        local lowerTarget = string.lower(targetName)
+        local found
+        for n in pairs(ThunderfuryAutoIgnoreDB.ignoredPlayers) do
+            if string.lower(n) == lowerTarget or
+                string.lower(n:match("^([^%-]+)") or n) == lowerTarget then
+                found = n
+                break
+            end
+        end
+        if found then
+            local nameOnly = found:match("^([^%-]+)") or found
+            SafeDelIgnore(nameOnly)
+            ThunderfuryAutoIgnoreDB.ignoredPlayers[found] = nil
+            print("|cffff8c00TFA:|r Removed " .. found)
+            if ignoreFrame:IsShown() then UpdateIgnoreList() end
+        else
+            print("|cffff8c00TFA:|r " .. targetName .. " not found in DB")
+        end
+
     elseif command == "help" then
         print("|cffff8c00TFA Help:|r")
         print("  /tfa          - show ignore list")
         print("  /tfa options  - open settings panel")
         print("  /tfa enable   - turn on auto-ignore")
         print("  /tfa disable  - turn off auto-ignore")
-        print("  /tfa add Name - manually add a player")
-        print("  /tfa sync     - re-sync DB to this character")
-        print("  /tfa help     - this message")
+        print("  /tfa add Name    - manually add a player")
+        print("  /tfa remove Name - remove a player from DB")
+        print("  /tfa sync        - re-sync DB to this character")
+        print("  /tfa verify      - check if permanent ignores still exist")
+        print("  /tfa help        - this message")
 
     else
         print("|cffff8c00TFA:|r Unknown command. Type /tfa help")
