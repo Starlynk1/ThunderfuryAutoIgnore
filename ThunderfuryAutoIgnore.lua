@@ -53,20 +53,26 @@ end
 -- Classic Anniversary exposes C_FriendList; older builds use globals.
 -- Using the explicit Add/Del functions instead of the /ignore toggle
 -- prevents accidental double-toggles.
+-- The game API on Classic uses name-only (no realm suffix), so we strip
+-- the realm before calling through.
 -- ---------------------------------------------------------------------------
+local function StripRealm(name) return name:match("^([^%-]+)") or name end
+
 local function SafeAddIgnore(name)
+    local nameOnly = StripRealm(name)
     if C_FriendList and C_FriendList.AddIgnore then
-        C_FriendList.AddIgnore(name)
+        C_FriendList.AddIgnore(nameOnly)
     elseif AddIgnore then
-        AddIgnore(name)
+        AddIgnore(nameOnly)
     end
 end
 
 local function SafeDelIgnore(name)
+    local nameOnly = StripRealm(name)
     if C_FriendList and C_FriendList.DelIgnore then
-        C_FriendList.DelIgnore(name)
+        C_FriendList.DelIgnore(nameOnly)
     elseif DelIgnore then
-        DelIgnore(name)
+        DelIgnore(nameOnly)
     end
 end
 
@@ -370,7 +376,7 @@ end
 -- All operations are immediate (no staggering).  A ShowFriends() call
 -- at the end nudges the client to refresh the social data.
 -- ---------------------------------------------------------------------------
-local function SyncIgnoreList()
+local function SyncIgnoreList(silent)
     -- 1.  Clean expired entries out of the addon DB
     CleanIgnoreList()
 
@@ -427,12 +433,14 @@ local function SyncIgnoreList()
     for _ in pairs(ThunderfuryAutoIgnoreDB.ignoredPlayers or {}) do
         total = total + 1
     end
-    if added > 0 then
-        print("|cffff8c00TFA:|r Added " .. added .. " missing ignore(s) — " ..
-                  total .. " total tracked")
-    elseif total > 0 then
-        print("|cffff8c00TFA:|r Ignore list in sync — " .. total ..
-                  " player(s) tracked")
+    if not silent then
+        if added > 0 then
+            print("|cffff8c00TFA:|r Added " .. added ..
+                      " missing ignore(s) — " .. total .. " total tracked")
+        elseif total > 0 then
+            print("|cffff8c00TFA:|r Ignore list in sync — " .. total ..
+                      " player(s) tracked")
+        end
     end
 end
 
@@ -618,11 +626,6 @@ f:SetScript("OnEvent", function(self, event, ...)
         -- Safety net: if the event never fires or never has data, sync anyway
         if C_Timer and C_Timer.After then C_Timer.After(15, DoSync) end
 
-        -- Periodic cleanup every 5 minutes
-        if C_Timer and C_Timer.NewTicker then
-            C_Timer.NewTicker(300, CleanIgnoreList)
-        end
-
         f:UnregisterEvent("PLAYER_ENTERING_WORLD")
 
     elseif event == "IGNORELIST_UPDATE" then
@@ -651,9 +654,13 @@ f:SetScript("OnEvent", function(self, event, ...)
             end
 
             local lowerName = string.lower(playerName)
+            local lowerNameOnly = lowerName:match("^([^%-]+)") or lowerName
             local existingName
             for storedName, _ in pairs(ThunderfuryAutoIgnoreDB.ignoredPlayers) do
-                if string.lower(storedName) == lowerName then
+                local storedLower = string.lower(storedName)
+                local storedNameOnly = storedLower:match("^([^%-]+)") or
+                                           storedLower
+                if storedLower == lowerName or storedNameOnly == lowerNameOnly then
                     existingName = storedName
                     break
                 end
@@ -924,7 +931,7 @@ SlashCmdList["THUNDERFURYAUTOIGNORE"] = function(cmd)
     command = command or cmd
 
     if command == "" then
-        SyncIgnoreList()
+        SyncIgnoreList(true)
         UpdateIgnoreList()
         ignoreFrame:Show()
 
@@ -1030,7 +1037,7 @@ local tfaLDB = LDB:NewDataObject("ThunderfuryAutoIgnore", {
             if ignoreFrame:IsShown() then
                 ignoreFrame:Hide()
             else
-                SyncIgnoreList()
+                SyncIgnoreList(true)
                 UpdateIgnoreList()
                 ignoreFrame:Show()
             end
