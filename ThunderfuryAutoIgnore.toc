@@ -1,5 +1,6 @@
-## Interface: 11404
+## Interface: 11404, 20504, 50401
 ## Title: Thunderfury Auto Ignore
+## Version: 0.2.0
 ## Notes: Automatically ignores players who say 'Thunderfury, Blessed Blade of the Windseeker'.
 ## Author: @Starlynk1, @Grok
 ## SavedVariables: ThunderfuryAutoIgnoreDB
