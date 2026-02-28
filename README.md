@@ -1,6 +1,7 @@
 # Thunderfury Auto Ignore
 
-Originally designed as a way for me to remove and block those that spam useless crap just because it's an annoying thing for others quite often. As I've used it, I decided that it needed more functionality for all those spam related things that become a nuisance.
+Originally designed as a way for me to remove and block those that spam useless crap just because it's an annoying thing for others. 
+As I've used it, I decided that it needed more functionality for all those spam related things that become a nuisance.
 
 TFA intercepts chat messages before they are seen and removes the message. At the same time, it will block that player for a chosen period of time. Default time is 24 hours which is the max time unless permanently ignored.
 
