@@ -1,4 +1,5 @@
 -- ============================================================================
+-- Version: 0.2.0
 -- ThunderfuryAutoIgnore
 -- Automatically ignores players who spam and removes them after a
 -- configurable number of hours.  The ignore list is account-wide: on login
