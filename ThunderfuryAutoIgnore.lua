@@ -1,7 +1,7 @@
 -- ============================================================================
 -- ThunderfuryAutoIgnore
 -- Automatically ignores players who spam and removes them after a
--- configurable number of days.  The ignore list is account-wide: on login
+-- configurable number of hours.  The ignore list is account-wide: on login
 -- every non-expired entry is re-applied to the current character's game
 -- ignore list, so switching characters keeps the list in sync.
 -- ============================================================================
@@ -13,11 +13,8 @@ ThunderfuryAutoIgnoreDB.ignoredPlayers =
     ThunderfuryAutoIgnoreDB.ignoredPlayers or {}
 ThunderfuryAutoIgnoreDB.settings = ThunderfuryAutoIgnoreDB.settings or {
     enabled = true,
-    thunderfury = true,
-    itemLink = true,
-    ignoreDays = 1,
+    ignoreHours = 1,
     customPhrases = {},
-    useContains = true,
     minimapPos = 220,
     minimapHide = false
 }
@@ -57,6 +54,24 @@ end
 -- the realm before calling through.
 -- ---------------------------------------------------------------------------
 local function StripRealm(name) return name:match("^([^%-]+)") or name end
+
+local function ParseItemLink(text)
+    -- Normalise escaped pipes (\124 → |) that Wowhead copy-paste uses
+    local normalised = text:gsub("\\124", "|")
+
+    -- Try to extract a full item link:  |cXXXXXXXX|Hitem:ID:...|h[Name]|h|r
+    -- We capture the |Hitem:...|h[...]|h portion for storage.
+    local fullLink = normalised:match("(|c%%x+|Hitem:%d+.-|h%[.-%]|h|r)")
+    if not fullLink then
+        fullLink = normalised:match("(|Hitem:%d+.-|h%[.-%]|h)")
+    end
+
+    -- Extract item ID from the link or from a Wowhead URL
+    local itemId = normalised:match("|Hitem:(%d+):")
+    if not itemId then itemId = text:match("wowhead%.com/.-item=(%d+)") end
+
+    return itemId, fullLink
+end
 
 local function SafeAddIgnore(name)
     local nameOnly = StripRealm(name)
@@ -112,7 +127,7 @@ ignoreFrame:SetBackdrop({
     tile = false,
     tileSize = 16,
     edgeSize = 16,
-    insets = {left = 5, right = 5, top = 5, bottom = 5}
+    insets = {left = 4, right = 4, top = 4, bottom = 4}
 })
 ignoreFrame:SetBackdropColor(0.1, 0.1, 0.1, 1)
 ignoreFrame:SetBackdropBorderColor(1, 1, 1, 1)
@@ -126,7 +141,7 @@ closeButton:SetPoint("TOPRIGHT", -5, -5)
 -- Title
 local title = ignoreFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 title:SetPoint("TOP", 0, -15)
-title:SetText("Thunderfury Auto Ignore List")
+title:SetText("Thunderfury Auto Ignore")
 
 -- Scroll frame
 local scrollFrame = CreateFrame("ScrollFrame", "ThunderfuryAutoIgnoreScroll",
@@ -193,25 +208,31 @@ local function IsSpamMessage(msg)
     if not settings.enabled then return false end
     local lowerMsg = string.lower(msg)
 
-    -- Built-in rules
-    if settings.thunderfury and msg ==
-        "Thunderfury, Blessed Blade of the Windseeker" then return true end
-    if settings.itemLink and msg:find("|Hitem:19019:") then return true end
-
-    -- Custom phrases (one per entry)
+    -- Custom phrases (per-entry contains / item-link matching)
     local phrases = settings.customPhrases or {}
-    for _, phrase in ipairs(phrases) do
-        if phrase ~= "" then
-            local lowerPhrase = string.lower(phrase)
-            if settings.useContains then
-                -- substring / "contains" match
-                if lowerMsg:find(lowerPhrase, 1, true) then
+    for _, entry in ipairs(phrases) do
+        if type(entry) == "table" then
+            if entry.itemId then
+                -- Match in-game item links by item ID
+                if msg:find("|Hitem:" .. entry.itemId .. ":") then
                     return true
                 end
-            else
-                -- exact full-message match
-                if lowerMsg == lowerPhrase then return true end
+            elseif entry.text and entry.text ~= "" then
+                local lowerPhrase = string.lower(entry.text)
+                if entry.contains then
+                    if lowerMsg:find(lowerPhrase, 1, true) then
+                        return true
+                    end
+                else
+                    if lowerMsg == lowerPhrase then
+                        return true
+                    end
+                end
             end
+        elseif type(entry) == "string" and entry ~= "" then
+            -- Legacy format fallback
+            local lowerPhrase = string.lower(entry)
+            if lowerMsg:find(lowerPhrase, 1, true) then return true end
         end
     end
 
@@ -224,8 +245,8 @@ end
 local function CleanIgnoreList()
     local now = time()
     local settings = ThunderfuryAutoIgnoreDB.settings or {}
-    local days = math.max(1, settings.ignoreDays or 7)
-    local expire = days * 86400
+    local hours = math.max(1, settings.ignoreHours or 1)
+    local expire = hours * 3600
     local toRemove = {}
     for name, data in pairs(ThunderfuryAutoIgnoreDB.ignoredPlayers or {}) do
         if not data.permanent and now - data.timestamp > expire then
@@ -238,8 +259,7 @@ local function CleanIgnoreList()
         SafeDelIgnore(name)
         ThunderfuryAutoIgnoreDB.ignoredPlayers[name] = nil
         print("|cffff8c00TFA:|r Auto-unignored " .. name .. " (ignored " ..
-                  ignoredAt .. ", " .. days .. "-day / " .. (days * 24) ..
-                  "hr expiry)")
+                  ignoredAt .. ", " .. hours .. "hr expiry)")
     end
 end
 
@@ -520,8 +540,8 @@ local function UpdateIgnoreList()
                                     0.6)
             else
                 local settings = ThunderfuryAutoIgnoreDB.settings or {}
-                local days = math.max(1, settings.ignoreDays or 1)
-                local expiresAt = data.timestamp + days * 86400
+                local hours = math.max(1, settings.ignoreHours or 1)
+                local expiresAt = data.timestamp + hours * 3600
                 local remaining = expiresAt - time()
                 GameTooltip:AddLine("Expires: " .. FormatDateTime(expiresAt), 1,
                                     1, 1)
@@ -564,17 +584,103 @@ f:SetScript("OnEvent", function(self, event, ...)
         if s == nil then
             ThunderfuryAutoIgnoreDB.settings = {
                 enabled = true,
-                thunderfury = true,
-                itemLink = true,
-                ignoreDays = 1,
-                customPhrases = {},
-                useContains = true
+                ignoreHours = 1,
+                customPhrases = {}
             }
             s = ThunderfuryAutoIgnoreDB.settings
         end
-        if s.ignoreDays == nil then s.ignoreDays = 1 end
+        -- Migrate old ignoreDays setting to ignoreHours
+        if s.ignoreDays and not s.ignoreHours then
+            s.ignoreHours = math.min(s.ignoreDays * 24, 24)
+            s.ignoreDays = nil
+        end
+        if s.ignoreHours == nil then s.ignoreHours = 1 end
         if s.customPhrases == nil then s.customPhrases = {} end
-        if s.useContains == nil then s.useContains = true end
+
+        -- Migrate flat string custom phrases to per-phrase format
+        if s.customPhrases and #s.customPhrases > 0 and type(s.customPhrases[1]) ==
+            "string" then
+            local newPhrases = {}
+            for _, phrase in ipairs(s.customPhrases) do
+                table.insert(newPhrases, {
+                    text = phrase,
+                    contains = s.useContains and true or false
+                })
+            end
+            s.customPhrases = newPhrases
+        end
+
+        -- Seed default Thunderfury entries if customPhrases is empty
+        -- (fresh install) or migrate from old thunderfury/itemLink settings
+        local function HasThunderfuryPhrase()
+            for _, e in ipairs(s.customPhrases) do
+                if type(e) == "table" and e.text and e.text ==
+                    "Thunderfury, Blessed Blade of the Windseeker" and
+                    not e.itemId then return true end
+            end
+            return false
+        end
+        local function HasThunderfuryItem()
+            for _, e in ipairs(s.customPhrases) do
+                if type(e) == "table" and e.itemId == "19019" then
+                    return true
+                end
+            end
+            return false
+        end
+
+        -- Add defaults if missing (fresh install or migrating from checkbox era)
+        if #s.customPhrases == 0 or
+            (s.thunderfury ~= false and not HasThunderfuryPhrase()) then
+            if not HasThunderfuryPhrase() then
+                table.insert(s.customPhrases, 1, {
+                    text = "Thunderfury, Blessed Blade of the Windseeker",
+                    contains = false
+                })
+            end
+        end
+        if #s.customPhrases == 0 or
+            (s.itemLink ~= false and not HasThunderfuryItem()) then
+            if not HasThunderfuryItem() then
+                -- Try to get the real item link from the cache
+                local tfName, tfLink = GetItemInfo(19019)
+                table.insert(s.customPhrases, {
+                    text = tfName or
+                        "Thunderfury, Blessed Blade of the Windseeker",
+                    itemId = "19019",
+                    itemLink = tfLink,
+                    displayName = tfName or
+                        "Thunderfury, Blessed Blade of the Windseeker"
+                })
+                -- If not cached yet, update once the server responds
+                if not tfLink then
+                    local tfWait = CreateFrame("Frame")
+                    tfWait:RegisterEvent("GET_ITEM_INFO_RECEIVED")
+                    tfWait:SetScript("OnEvent", function(self, event, queriedId)
+                        if tonumber(queriedId) == 19019 then
+                            self:UnregisterAllEvents()
+                            local n, l = GetItemInfo(19019)
+                            if n and l then
+                                for _, e in ipairs(
+                                                ThunderfuryAutoIgnoreDB.settings
+                                                    .customPhrases) do
+                                    if type(e) == "table" and e.itemId ==
+                                        "19019" and not e.itemLink then
+                                        e.itemLink = l
+                                        e.displayName = n
+                                        e.text = n
+                                    end
+                                end
+                            end
+                        end
+                    end)
+                end
+            end
+        end
+
+        -- Clean up old settings keys
+        s.thunderfury = nil
+        s.itemLink = nil
 
         f:RegisterEvent("PLAYER_ENTERING_WORLD")
         f:UnregisterEvent("VARIABLES_LOADED")
@@ -765,84 +871,49 @@ enableCheck:SetScript("OnClick", function(self)
                   "Disabled"))
 end)
 
--- Ignore duration (dropdown 1-10 days) ------------------------------------
-local daysLabel =
-    optionsPanel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-daysLabel:SetPoint("TOPLEFT", enableCheck, "BOTTOMLEFT", 4, -18)
-daysLabel:SetText("Days before auto-unignore:")
+-- Ignore duration (dropdown 1-24 hours) -----------------------------------
+local hoursLabel = optionsPanel:CreateFontString(nil, "OVERLAY",
+                                                 "GameFontNormal")
+hoursLabel:SetPoint("TOPLEFT", enableCheck, "BOTTOMLEFT", 4, -18)
+hoursLabel:SetText("Hours before auto-unignore:")
 
-local daysDropdown = CreateFrame("Frame", "TFADaysDropdown", optionsPanel,
-                                 "UIDropDownMenuTemplate")
-daysDropdown:SetPoint("LEFT", daysLabel, "RIGHT", -8, -2)
-UIDropDownMenu_SetWidth(daysDropdown, 50)
+local hoursDropdown = CreateFrame("Frame", "TFAHoursDropdown", optionsPanel,
+                                  "UIDropDownMenuTemplate")
+hoursDropdown:SetPoint("LEFT", hoursLabel, "RIGHT", -8, -2)
+UIDropDownMenu_SetWidth(hoursDropdown, 50)
 
-local function DaysDropdown_Initialize(self, level)
-    for i = 1, 10 do
+local function HoursDropdown_Initialize(self, level)
+    for i = 1, 24 do
         local info = UIDropDownMenu_CreateInfo()
         info.text = tostring(i)
         info.value = i
         info.func = function(btn)
-            ThunderfuryAutoIgnoreDB.settings.ignoreDays = btn.value
-            UIDropDownMenu_SetSelectedValue(daysDropdown, btn.value)
+            ThunderfuryAutoIgnoreDB.settings.ignoreHours = btn.value
+            UIDropDownMenu_SetSelectedValue(hoursDropdown, btn.value)
         end
-        info.checked = (ThunderfuryAutoIgnoreDB.settings.ignoreDays == i)
+        info.checked = (ThunderfuryAutoIgnoreDB.settings.ignoreHours == i)
         UIDropDownMenu_AddButton(info, level)
     end
 end
-UIDropDownMenu_Initialize(daysDropdown, DaysDropdown_Initialize)
-UIDropDownMenu_SetSelectedValue(daysDropdown, ThunderfuryAutoIgnoreDB.settings
-                                    .ignoreDays or 1)
-
--- Thunderfury exact text -------------------------------------------------
-local tfCheck = CreateFrame("CheckButton", nil, optionsPanel,
-                            "InterfaceOptionsCheckButtonTemplate")
-tfCheck:SetPoint("TOPLEFT", daysLabel, "BOTTOMLEFT", -4, -12)
-tfCheck.label = tfCheck:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-tfCheck.label:SetPoint("LEFT", tfCheck, "RIGHT", 5, 0)
-tfCheck.label:SetText(
-    "Ignore 'Thunderfury, Blessed Blade of the Windseeker' spam")
-tfCheck:SetScript("OnClick", function(self)
-    ThunderfuryAutoIgnoreDB.settings.thunderfury = self:GetChecked()
-end)
-
--- Thunderfury item link ---------------------------------------------------
-local itemCheck = CreateFrame("CheckButton", nil, optionsPanel,
-                              "InterfaceOptionsCheckButtonTemplate")
-itemCheck:SetPoint("TOPLEFT", tfCheck, "BOTTOMLEFT", 0, -8)
-itemCheck.label = itemCheck:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-itemCheck.label:SetPoint("LEFT", itemCheck, "RIGHT", 5, 0)
-itemCheck.label:SetText("Ignore Thunderfury item link spam")
-itemCheck:SetScript("OnClick", function(self)
-    ThunderfuryAutoIgnoreDB.settings.itemLink = self:GetChecked()
-end)
-
--- Contains matching for custom phrases ------------------------------------
-local containsCheck = CreateFrame("CheckButton", nil, optionsPanel,
-                                  "InterfaceOptionsCheckButtonTemplate")
-containsCheck:SetPoint("TOPLEFT", itemCheck, "BOTTOMLEFT", 0, -8)
-containsCheck.label = containsCheck:CreateFontString(nil, "OVERLAY",
-                                                     "GameFontNormal")
-containsCheck.label:SetPoint("LEFT", containsCheck, "RIGHT", 5, 0)
-containsCheck.label:SetText(
-    "Custom phrases use 'contains' matching (uncheck for exact match)")
-containsCheck:SetScript("OnClick", function(self)
-    ThunderfuryAutoIgnoreDB.settings.useContains = self:GetChecked()
-end)
+UIDropDownMenu_Initialize(hoursDropdown, HoursDropdown_Initialize)
+UIDropDownMenu_SetSelectedValue(hoursDropdown, ThunderfuryAutoIgnoreDB.settings
+                                    .ignoreHours or 1)
 
 -- ---------------------------------------------------------------------------
--- Custom phrases  (multiline editor)
+-- Custom Phrases — list + Add popup
 -- ---------------------------------------------------------------------------
-local phrasesLabel = optionsPanel:CreateFontString(nil, "OVERLAY",
-                                                   "GameFontNormal")
-phrasesLabel:SetPoint("TOPLEFT", containsCheck, "BOTTOMLEFT", 0, -20)
-phrasesLabel:SetText("Custom blocked phrases (one per line, case-insensitive):")
+local phraseSectionLabel = optionsPanel:CreateFontString(nil, "OVERLAY",
+                                                         "GameFontNormal")
+phraseSectionLabel:SetPoint("TOPLEFT", hoursLabel, "BOTTOMLEFT", -4, -20)
+phraseSectionLabel:SetText("Blocked Phrases/Items:")
 
-local phrasesScrollFrame = CreateFrame("ScrollFrame", "TFAPhrasesScroll",
-                                       optionsPanel,
-                                       "UIPanelScrollFrameTemplate,BackdropTemplate")
-phrasesScrollFrame:SetPoint("TOPLEFT", phrasesLabel, "BOTTOMLEFT", 0, -8)
-phrasesScrollFrame:SetSize(350, 120)
-phrasesScrollFrame:SetBackdrop({
+-- Scroll frame for phrase list
+local phraseListScroll = CreateFrame("ScrollFrame", "TFAPhraseListScroll",
+                                     optionsPanel,
+                                     "UIPanelScrollFrameTemplate,BackdropTemplate")
+phraseListScroll:SetPoint("TOPLEFT", phraseSectionLabel, "BOTTOMLEFT", 0, -6)
+phraseListScroll:SetSize(370, 100)
+phraseListScroll:SetBackdrop({
     bgFile = "Interface\\Buttons\\WHITE8X8",
     edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
     tile = false,
@@ -850,60 +921,374 @@ phrasesScrollFrame:SetBackdrop({
     edgeSize = 12,
     insets = {left = 4, right = 4, top = 4, bottom = 4}
 })
-phrasesScrollFrame:SetBackdropColor(0.05, 0.05, 0.05, 1)
-phrasesScrollFrame:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
+phraseListScroll:SetBackdropColor(0.05, 0.05, 0.05, 1)
+phraseListScroll:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
 
--- The EditBox lives inside a plain container frame that is the scroll child.
--- This guarantees the EditBox gets proper layout and click-to-focus works.
-local phrasesContent = CreateFrame("Frame", nil, phrasesScrollFrame)
-phrasesContent:SetSize(326, 500)
+-- Move the scrollbar inside the frame
+local phraseScrollBar = _G["TFAPhraseListScrollScrollBar"]
+if phraseScrollBar then
+    phraseScrollBar:ClearAllPoints()
+    phraseScrollBar:SetPoint("TOPRIGHT", phraseListScroll, "TOPRIGHT", -4, -18)
+    phraseScrollBar:SetPoint("BOTTOMRIGHT", phraseListScroll, "BOTTOMRIGHT", -4,
+                             18)
+end
 
-local phrasesEditBox = CreateFrame("EditBox", "TFAPhrasesEditBox",
-                                   phrasesContent)
-phrasesEditBox:SetMultiLine(true)
-phrasesEditBox:SetAutoFocus(false)
-phrasesEditBox:SetFontObject("ChatFontNormal")
-phrasesEditBox:SetAllPoints(phrasesContent)
-phrasesEditBox:SetTextInsets(6, 6, 4, 4)
-phrasesEditBox:EnableMouse(true)
-phrasesEditBox:SetScript("OnMouseDown", function(self) self:SetFocus() end)
-phrasesEditBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
-phrasesEditBox:SetScript("OnCursorChanged", function(self, x, y, w, h)
-    local sf = phrasesScrollFrame
-    local vs = sf:GetVerticalScroll()
-    local sfh = sf:GetHeight()
-    local cursorY = -y
-    if cursorY < vs then
-        sf:SetVerticalScroll(cursorY)
-    elseif cursorY + h > vs + sfh then
-        sf:SetVerticalScroll(cursorY + h - sfh)
+local phraseListContent = CreateFrame("Frame", nil, phraseListScroll)
+phraseListContent:SetSize(346, 1)
+phraseListScroll:SetScrollChild(phraseListContent)
+
+-- Row pool for phrase list display
+local phraseLinePool = {}
+local activePhraseLines = {}
+
+local function AcquirePhraseLine()
+    local line = table.remove(phraseLinePool)
+    if not line then
+        line = CreateFrame("Frame", nil, phraseListContent)
+        line:SetSize(340, 18)
+        line:EnableMouse(true)
+        line.text = line:CreateFontString(nil, "OVERLAY",
+                                          "ThunderfuryAutoIgnoreFont")
+        line.text:SetPoint("LEFT", 4, 0)
+        line.text:SetPoint("RIGHT", -24, 0)
+        line.text:SetJustifyH("LEFT")
+        line.text:SetWordWrap(false)
+        line.removeBtn = CreateFrame("Button", nil, line)
+        line.removeBtn:SetSize(16, 16)
+        line.removeBtn:SetPoint("RIGHT", -2, 0)
+        line.removeBtn.label = line.removeBtn:CreateFontString(nil, "OVERLAY",
+                                                               "GameFontNormalSmall")
+        line.removeBtn.label:SetAllPoints()
+        line.removeBtn.label:SetText("|cffff4444X|r")
+        line.removeBtn:SetHighlightTexture(
+            "Interface\\Buttons\\UI-Common-MouseHilight", "ADD")
+    end
+    -- Clear any previous tooltip scripts
+    line:SetScript("OnEnter", nil)
+    line:SetScript("OnLeave", nil)
+    line:Show()
+    table.insert(activePhraseLines, line)
+    return line
+end
+
+local function ReleaseAllPhraseLines()
+    for _, line in ipairs(activePhraseLines) do
+        line:Hide()
+        line:ClearAllPoints()
+        table.insert(phraseLinePool, line)
+    end
+    wipe(activePhraseLines)
+end
+
+local function RefreshPhraseList()
+    ReleaseAllPhraseLines()
+    local phrases = ThunderfuryAutoIgnoreDB.settings.customPhrases or {}
+    local yOffset = 0
+    for i, entry in ipairs(phrases) do
+        local line = AcquirePhraseLine()
+        line:SetPoint("TOPLEFT", 0, yOffset)
+        if type(entry) == "table" then
+            if entry.itemId then
+                -- Try to get the real item link from the game for display
+                local displayLink = entry.itemLink
+                if not displayLink then
+                    local _, link = GetItemInfo(tonumber(entry.itemId))
+                    displayLink = link
+                end
+                if displayLink then
+                    line.text:SetText("|cff00ccff[Item]|r " .. displayLink)
+                    -- Tooltip on hover
+                    local storedLink = displayLink
+                    line:SetScript("OnEnter", function(self)
+                        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                        GameTooltip:SetHyperlink(storedLink)
+                        GameTooltip:Show()
+                    end)
+                    line:SetScript("OnLeave", function()
+                        GameTooltip:Hide()
+                    end)
+                else
+                    line.text:SetText("|cff00ccff[Item:" .. entry.itemId ..
+                                          "]|r " ..
+                                          (entry.displayName or "loading..."))
+                end
+            else
+                local tag = entry.contains and "|cff00ff00[Contains]|r " or
+                                "|cffffcc00[Exact]|r "
+                line.text:SetText(tag .. (entry.text or ""))
+            end
+        else
+            line.text:SetText(tostring(entry))
+        end
+        local idx = i
+        line.removeBtn:SetScript("OnClick", function()
+            table.remove(ThunderfuryAutoIgnoreDB.settings.customPhrases, idx)
+            RefreshPhraseList()
+            print("|cffff8c00TFA:|r Removed custom phrase")
+        end)
+        yOffset = yOffset - 20
+    end
+    phraseListContent:SetHeight(math.max(1, -yOffset))
+end
+
+-- "Add" button below the list (left-aligned)
+local addPhraseBtn = CreateFrame("Button", nil, optionsPanel,
+                                 "UIPanelButtonTemplate")
+addPhraseBtn:SetSize(60, 24)
+addPhraseBtn:SetPoint("TOPLEFT", phraseListScroll, "BOTTOMLEFT", 0, -6)
+addPhraseBtn:SetText("Add")
+
+-- "Add Thunderfury" button (right-aligned)
+local addTFBtn = CreateFrame("Button", nil, optionsPanel,
+                             "UIPanelButtonTemplate")
+addTFBtn:SetSize(120, 24)
+addTFBtn:SetPoint("TOPRIGHT", phraseListScroll, "BOTTOMRIGHT", 0, -6)
+addTFBtn:SetText("Add Thunderfury")
+addTFBtn:SetScript("OnClick", function()
+    local phrases = ThunderfuryAutoIgnoreDB.settings.customPhrases
+    -- Check if they already exist
+    local hasPhrase, hasItem = false, false
+    for _, e in ipairs(phrases) do
+        if type(e) == "table" then
+            if e.text == "Thunderfury, Blessed Blade of the Windseeker" and
+                not e.itemId then hasPhrase = true end
+            if e.itemId == "19019" then hasItem = true end
+        end
+    end
+    local added = 0
+    if not hasPhrase then
+        table.insert(phrases, {
+            text = "Thunderfury, Blessed Blade of the Windseeker",
+            contains = false
+        })
+        added = added + 1
+    end
+    if not hasItem then
+        local tfName, tfLink = GetItemInfo(19019)
+        local newEntry = {
+            text = tfName or "Thunderfury, Blessed Blade of the Windseeker",
+            itemId = "19019",
+            itemLink = tfLink,
+            displayName = tfName or
+                "Thunderfury, Blessed Blade of the Windseeker"
+        }
+        table.insert(phrases, newEntry)
+        added = added + 1
+        -- If not cached, resolve once server responds
+        if not tfLink then
+            local tfWait = CreateFrame("Frame")
+            tfWait:RegisterEvent("GET_ITEM_INFO_RECEIVED")
+            tfWait:SetScript("OnEvent", function(self, event, queriedId)
+                if tonumber(queriedId) == 19019 then
+                    self:UnregisterAllEvents()
+                    local n, l = GetItemInfo(19019)
+                    if n and l then
+                        newEntry.itemLink = l
+                        newEntry.displayName = n
+                        newEntry.text = n
+                        RefreshPhraseList()
+                    end
+                end
+            end)
+        end
+    end
+    if added > 0 then
+        RefreshPhraseList()
+        print("|cffff8c00TFA:|r Added Thunderfury filters (" .. added ..
+                  " entries)")
+    else
+        print("|cffff8c00TFA:|r Thunderfury filters already exist")
     end
 end)
-phrasesEditBox:SetScript("OnTextChanged", function(self)
-    -- Grow the content frame to fit text so the scrollbar works
-    local _, textH = self:GetFont()
-    local numLines = self:GetNumLetters() > 0 and
-                         select(2, self:GetText():gsub("\n", "\n")) + 2 or 2
-    local newH = math.max(120, numLines * (textH + 2))
-    phrasesContent:SetHeight(newH)
-end)
-phrasesScrollFrame:SetScrollChild(phrasesContent)
 
-local phrasesSaveBtn = CreateFrame("Button", nil, optionsPanel,
+-- ---------------------------------------------------------------------------
+-- Add Phrase popup frame
+-- ---------------------------------------------------------------------------
+local addPhrasePopup = CreateFrame("Frame", "TFAAddPhrasePopup", UIParent,
+                                   "BackdropTemplate")
+addPhrasePopup:SetSize(340, 170)
+addPhrasePopup:SetPoint("CENTER")
+addPhrasePopup:SetFrameStrata("DIALOG")
+addPhrasePopup:SetClampedToScreen(true)
+addPhrasePopup:SetMovable(true)
+addPhrasePopup:EnableMouse(true)
+addPhrasePopup:RegisterForDrag("LeftButton")
+addPhrasePopup:SetScript("OnDragStart", addPhrasePopup.StartMoving)
+addPhrasePopup:SetScript("OnDragStop", addPhrasePopup.StopMovingOrSizing)
+addPhrasePopup:SetBackdrop({
+    bgFile = "Interface\\Buttons\\WHITE8X8",
+    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+    tile = false,
+    tileSize = 16,
+    edgeSize = 16,
+    insets = {left = 4, right = 4, top = 4, bottom = 4}
+})
+addPhrasePopup:SetBackdropColor(0.1, 0.1, 0.1, 1)
+addPhrasePopup:SetBackdropBorderColor(1, 1, 1, 1)
+addPhrasePopup:Hide()
+tinsert(UISpecialFrames, "TFAAddPhrasePopup")
+
+-- Hook shift-click item linking so it pastes into our edit box
+hooksecurefunc("ChatEdit_InsertLink", function(link)
+    if addPhrasePopup:IsShown() and popupEditBox:HasFocus() then
+        popupEditBox:SetText(link)
+    end
+end)
+
+-- Popup title
+local popupTitle = addPhrasePopup:CreateFontString(nil, "OVERLAY",
+                                                   "GameFontNormal")
+popupTitle:SetPoint("TOP", 0, -12)
+popupTitle:SetText("Add Custom Phrase")
+
+-- Popup close button
+local popupClose = CreateFrame("Button", nil, addPhrasePopup,
+                               "UIPanelCloseButton")
+popupClose:SetPoint("TOPRIGHT", -2, -2)
+
+-- Text input label
+local popupInputLabel = addPhrasePopup:CreateFontString(nil, "OVERLAY",
+                                                        "GameFontNormal")
+popupInputLabel:SetPoint("TOPLEFT", 16, -36)
+popupInputLabel:SetText("Phrase or item link:")
+
+-- Text input
+local popupEditBox = CreateFrame("EditBox", "TFAPopupEditBox", addPhrasePopup,
+                                 "BackdropTemplate")
+popupEditBox:SetPoint("TOPLEFT", popupInputLabel, "BOTTOMLEFT", 0, -4)
+popupEditBox:SetSize(308, 24)
+popupEditBox:SetAutoFocus(false)
+popupEditBox:SetFontObject("ChatFontNormal")
+popupEditBox:SetTextInsets(6, 6, 0, 0)
+popupEditBox:SetBackdrop({
+    bgFile = "Interface\\Buttons\\WHITE8X8",
+    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+    tile = false,
+    tileSize = 16,
+    edgeSize = 12,
+    insets = {left = 4, right = 4, top = 4, bottom = 4}
+})
+popupEditBox:SetBackdropColor(0.05, 0.05, 0.05, 1)
+popupEditBox:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
+popupEditBox:SetScript("OnEscapePressed", function(self)
+    self:ClearFocus()
+    addPhrasePopup:Hide()
+end)
+
+-- Match type: Contains checkbox (only applies to text phrases, not item links)
+local popupContainsCheck = CreateFrame("CheckButton", nil, addPhrasePopup,
+                                       "InterfaceOptionsCheckButtonTemplate")
+popupContainsCheck:SetPoint("TOPLEFT", popupEditBox, "BOTTOMLEFT", -4, -6)
+popupContainsCheck:SetChecked(true)
+popupContainsCheck.label = popupContainsCheck:CreateFontString(nil, "OVERLAY",
+                                                               "GameFontNormal")
+popupContainsCheck.label:SetPoint("LEFT", popupContainsCheck, "RIGHT", 5, 0)
+popupContainsCheck.label:SetText("Use 'contains' matching (for text phrases)")
+
+-- Cancel button (anchored to bottom-right of popup)
+local popupCancelBtn = CreateFrame("Button", nil, addPhrasePopup,
                                    "UIPanelButtonTemplate")
-phrasesSaveBtn:SetSize(120, 24)
-phrasesSaveBtn:SetPoint("TOPLEFT", phrasesScrollFrame, "BOTTOMLEFT", 0, -6)
-phrasesSaveBtn:SetText("Save Phrases")
-phrasesSaveBtn:SetScript("OnClick", function()
-    local text = phrasesEditBox:GetText() or ""
-    local phrases = {}
-    for line in text:gmatch("[^\r\n]+") do
-        local trimmed = line:match("^%s*(.-)%s*$")
-        if trimmed and trimmed ~= "" then table.insert(phrases, trimmed) end
+popupCancelBtn:SetSize(80, 24)
+popupCancelBtn:SetPoint("BOTTOMRIGHT", -16, 12)
+popupCancelBtn:SetText("Cancel")
+popupCancelBtn:SetScript("OnClick", function() addPhrasePopup:Hide() end)
+
+-- OK button (left of Cancel)
+local popupOkBtn = CreateFrame("Button", nil, addPhrasePopup,
+                               "UIPanelButtonTemplate")
+popupOkBtn:SetSize(80, 24)
+popupOkBtn:SetPoint("RIGHT", popupCancelBtn, "LEFT", -6, 0)
+popupOkBtn:SetText("OK")
+
+-- OK handler — auto-detect item link vs text phrase
+popupOkBtn:SetScript("OnClick", function()
+    local text = (popupEditBox:GetText() or ""):match("^%s*(.-)%s*$")
+    if not text or text == "" then return end
+
+    local entry
+    local itemId, fullLink = ParseItemLink(text)
+    if itemId then
+        -- Detected an item link — validate it exists on the server
+        local itemName, itemLink = GetItemInfo(tonumber(itemId))
+        if itemName and itemLink then
+            -- Item is cached and valid
+            entry = {
+                text = itemName,
+                itemId = itemId,
+                itemLink = itemLink,
+                displayName = itemName
+            }
+            table.insert(ThunderfuryAutoIgnoreDB.settings.customPhrases, entry)
+            RefreshPhraseList()
+            addPhrasePopup:Hide()
+            print("|cffff8c00TFA:|r Added item link filter: " .. itemLink)
+        else
+            -- Item not cached yet — request it and wait for GET_ITEM_INFO_RECEIVED
+            print("|cffff8c00TFA:|r Querying server for item " .. itemId ..
+                      "...")
+            local waitFrame = CreateFrame("Frame")
+            waitFrame:RegisterEvent("GET_ITEM_INFO_RECEIVED")
+            local timer
+            waitFrame:SetScript("OnEvent", function(self, event, queriedId)
+                if tostring(queriedId) == itemId then
+                    self:UnregisterAllEvents()
+                    if timer then
+                        timer:Cancel();
+                        timer = nil
+                    end
+                    local name2, link2 = GetItemInfo(tonumber(itemId))
+                    if name2 and link2 then
+                        entry = {
+                            text = name2,
+                            itemId = itemId,
+                            itemLink = link2,
+                            displayName = name2
+                        }
+                        table.insert(ThunderfuryAutoIgnoreDB.settings
+                                         .customPhrases, entry)
+                        RefreshPhraseList()
+                        addPhrasePopup:Hide()
+                        print("|cffff8c00TFA:|r Added item link filter: " ..
+                                  link2)
+                    else
+                        print("|cffff8c00TFA:|r Item " .. itemId ..
+                                  " not found on server.")
+                    end
+                end
+            end)
+            -- Timeout after 5 seconds
+            timer = C_Timer.NewTimer(5, function()
+                waitFrame:UnregisterAllEvents()
+                print("|cffff8c00TFA:|r Timed out looking up item " .. itemId ..
+                          ". It may not exist.")
+            end)
+        end
+    else
+        -- Plain text phrase
+        entry = {
+            text = text,
+            contains = popupContainsCheck:GetChecked() and true or false
+        }
+        table.insert(ThunderfuryAutoIgnoreDB.settings.customPhrases, entry)
+        RefreshPhraseList()
+        addPhrasePopup:Hide()
+        local mode = entry.contains and "contains" or "exact"
+        print("|cffff8c00TFA:|r Added custom phrase (" .. mode .. " match)")
     end
-    ThunderfuryAutoIgnoreDB.settings.customPhrases = phrases
-    print("|cffff8c00TFA:|r Saved " .. #phrases .. " custom phrase(s)")
 end)
+
+-- Enter in the edit box triggers OK
+popupEditBox:SetScript("OnEnterPressed", function() popupOkBtn:Click() end)
+
+-- Reset popup state when shown
+addPhrasePopup:SetScript("OnShow", function()
+    popupEditBox:SetText("")
+    popupContainsCheck:SetChecked(true)
+    popupEditBox:SetFocus()
+end)
+
+-- Wire up the Add Phrase button to open the popup
+addPhraseBtn:SetScript("OnClick", function() addPhrasePopup:Show() end)
 
 -- ---------------------------------------------------------------------------
 -- Refresh every control when the panel is shown
@@ -911,14 +1296,10 @@ end)
 optionsPanel:SetScript("OnShow", function()
     local s = ThunderfuryAutoIgnoreDB.settings or {}
     enableCheck:SetChecked(s.enabled)
-    tfCheck:SetChecked(s.thunderfury)
-    itemCheck:SetChecked(s.itemLink)
-    containsCheck:SetChecked(s.useContains)
-    UIDropDownMenu_SetSelectedValue(daysDropdown, s.ignoreDays or 1)
-    UIDropDownMenu_SetText(daysDropdown, tostring(s.ignoreDays or 1))
-    -- Populate the phrases editor
-    local phrases = s.customPhrases or {}
-    phrasesEditBox:SetText(table.concat(phrases, "\n"))
+    UIDropDownMenu_SetSelectedValue(hoursDropdown, s.ignoreHours or 1)
+    UIDropDownMenu_SetText(hoursDropdown, tostring(s.ignoreHours or 1))
+    -- Refresh the phrase list display
+    RefreshPhraseList()
 end)
 
 -- ===========================================================================
