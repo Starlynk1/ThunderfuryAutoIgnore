@@ -62,7 +62,7 @@ local function ParseItemLink(text)
 
     -- Try to extract a full item link:  |cXXXXXXXX|Hitem:ID:...|h[Name]|h|r
     -- We capture the |Hitem:...|h[...]|h portion for storage.
-    local fullLink = normalised:match("(|c%%x+|Hitem:%d+.-|h%[.-%]|h|r)")
+    local fullLink = normalised:match("(|c%x+|Hitem:%d+.-|h%[.-%]|h|r)")
     if not fullLink then
         fullLink = normalised:match("(|Hitem:%d+.-|h%[.-%]|h)")
     end
@@ -89,6 +89,85 @@ local function SafeDelIgnore(name)
         C_FriendList.DelIgnore(nameOnly)
     elseif DelIgnore then
         DelIgnore(nameOnly)
+    end
+end
+
+local function IgnoreNameKey(name)
+    local lower = string.lower(name or "")
+    return lower:match("^([^%-]+)") or lower
+end
+
+local function BuildGameIgnoreMap()
+    local map = {}
+    local numIgnored = C_FriendList and C_FriendList.GetNumIgnores and
+                           C_FriendList.GetNumIgnores() or
+                           (GetNumIgnores and GetNumIgnores()) or 0
+    for i = 1, numIgnored do
+        local ignoreName
+        if C_FriendList and C_FriendList.GetIgnoreName then
+            ignoreName = C_FriendList.GetIgnoreName(i)
+        elseif GetIgnoreName then
+            ignoreName = GetIgnoreName(i)
+        end
+        if ignoreName and ignoreName ~= "" then
+            map[IgnoreNameKey(ignoreName)] = ignoreName
+        end
+    end
+    return map
+end
+
+local function FindTrackedDBNameByKey(key)
+    for dbName, _ in pairs(ThunderfuryAutoIgnoreDB.ignoredPlayers or {}) do
+        if IgnoreNameKey(dbName) == key then return dbName end
+    end
+    return nil
+end
+
+local function ReconcileManualIgnoreChanges()
+    if not ThunderfuryAutoIgnoreDB or not ThunderfuryAutoIgnoreDB.ignoredPlayers then
+        return
+    end
+
+    local previous = f._lastGameIgnoreMap
+    local current = BuildGameIgnoreMap()
+
+    -- First snapshot after login/sync: establish baseline only.
+    if not previous then
+        f._lastGameIgnoreMap = current
+        return
+    end
+
+    local imported = 0
+    local removed = 0
+    local now = time()
+
+    -- Added in game ignore list outside tracked DB -> import as permanent
+    for key, gameName in pairs(current) do
+        if not previous[key] and not FindTrackedDBNameByKey(key) then
+            ThunderfuryAutoIgnoreDB.ignoredPlayers[gameName] = {
+                timestamp = now,
+                permanent = true
+            }
+            imported = imported + 1
+        end
+    end
+
+    -- Removed in game ignore list -> remove matching tracked DB entry
+    for key, _ in pairs(previous) do
+        if not current[key] then
+            local dbName = FindTrackedDBNameByKey(key)
+            if dbName then
+                ThunderfuryAutoIgnoreDB.ignoredPlayers[dbName] = nil
+                removed = removed + 1
+            end
+        end
+    end
+
+    f._lastGameIgnoreMap = current
+
+    if imported > 0 or removed > 0 then
+        print("|cffff8c00TFA:|r Synced manual ignore changes (added " ..
+                  imported .. ", removed " .. removed .. ")")
     end
 end
 
@@ -405,6 +484,7 @@ local function SyncIgnoreList(silent)
     --     The game may return names with or without a realm suffix, so we
     --     store both the full name and the name-only (before the hyphen).
     local gameIgnoreLookup = {}
+    local gameIgnoreNames = {}
     local numIgnored = C_FriendList and C_FriendList.GetNumIgnores and
                            C_FriendList.GetNumIgnores() or
                            (GetNumIgnores and GetNumIgnores()) or 0
@@ -416,11 +496,48 @@ local function SyncIgnoreList(silent)
             ignoreName = GetIgnoreName(i)
         end
         if ignoreName and ignoreName ~= "" then
+            table.insert(gameIgnoreNames, ignoreName)
             local lower = string.lower(ignoreName)
             gameIgnoreLookup[lower] = true
             -- Also store the name-only portion (strip realm)
             local nameOnly = lower:match("^([^%-]+)")
             if nameOnly then gameIgnoreLookup[nameOnly] = true end
+        end
+    end
+
+    -- 3.  Build a lowercase DB lookup so we can import game-only ignores
+    local dbLookup = {}
+    for dbName, _ in pairs(ThunderfuryAutoIgnoreDB.ignoredPlayers or {}) do
+        local lower = string.lower(dbName)
+        dbLookup[lower] = true
+        local nameOnly = lower:match("^([^%-]+)")
+        if nameOnly then dbLookup[nameOnly] = true end
+    end
+
+    local function IsTrackedInDB(name)
+        local lower = string.lower(name)
+        if dbLookup[lower] then return true end
+        local nameOnly = lower:match("^([^%-]+)")
+        if nameOnly and dbLookup[nameOnly] then return true end
+        return false
+    end
+
+    -- 4.  Import game ignores that are missing from DB as permanent entries
+    local imported = 0
+    local now = time()
+    for _, gameName in ipairs(gameIgnoreNames) do
+        if not IsTrackedInDB(gameName) then
+            ThunderfuryAutoIgnoreDB.ignoredPlayers[gameName] = {
+                timestamp = now,
+                permanent = true
+            }
+            imported = imported + 1
+
+            -- Keep lookup updated to avoid duplicates in this same sync pass
+            local lower = string.lower(gameName)
+            dbLookup[lower] = true
+            local nameOnly = lower:match("^([^%-]+)")
+            if nameOnly then dbLookup[nameOnly] = true end
         end
     end
 
@@ -434,7 +551,7 @@ local function SyncIgnoreList(silent)
         return false
     end
 
-    -- 3.  Add only DB entries that are missing from the game ignore list
+    -- 5.  Add only DB entries that are missing from the game ignore list
     local added = 0
     for name, _ in pairs(ThunderfuryAutoIgnoreDB.ignoredPlayers or {}) do
         if not IsAlreadyIgnored(name) then
@@ -443,21 +560,32 @@ local function SyncIgnoreList(silent)
         end
     end
 
-    -- 4.  Poke the social system so the client refreshes its ignore list
+    -- 6.  Poke the social system so the client refreshes its ignore list
     if C_FriendList and C_FriendList.ShowFriends then
         C_FriendList.ShowFriends()
     elseif ShowFriends then
         ShowFriends()
     end
 
+    -- Update runtime snapshot used to detect manual add/remove deltas.
+    f._lastGameIgnoreMap = BuildGameIgnoreMap()
+
     local total = 0
     for _ in pairs(ThunderfuryAutoIgnoreDB.ignoredPlayers or {}) do
         total = total + 1
     end
     if not silent then
-        if added > 0 then
+        if imported > 0 and added > 0 then
+            print("|cffff8c00TFA:|r Imported " .. imported ..
+                      " game ignore(s) as permanent, added " .. added ..
+                      " DB ignore(s) to game — " .. total .. " total tracked")
+        elseif imported > 0 then
+            print("|cffff8c00TFA:|r Imported " .. imported ..
+                      " game ignore(s) as permanent — " .. total ..
+                      " total tracked")
+        elseif added > 0 then
             print("|cffff8c00TFA:|r Added " .. added ..
-                      " missing ignore(s) — " .. total .. " total tracked")
+                      " DB ignore(s) to game — " .. total .. " total tracked")
         elseif total > 0 then
             print("|cffff8c00TFA:|r Ignore list in sync — " .. total ..
                       " player(s) tracked")
@@ -598,6 +726,23 @@ f:SetScript("OnEvent", function(self, event, ...)
         if s.ignoreHours == nil then s.ignoreHours = 1 end
         if s.customPhrases == nil then s.customPhrases = {} end
 
+        -- Migrate old minimap keys to nested minimap table
+        if type(s.minimap) ~= "table" then
+            s.minimap = {
+                hide = s.minimapHide and true or false,
+                minimapPos = tonumber(s.minimapPos) or 220
+            }
+        else
+            if s.minimap.hide == nil then
+                s.minimap.hide = s.minimapHide and true or false
+            end
+            if s.minimap.minimapPos == nil then
+                s.minimap.minimapPos = tonumber(s.minimapPos) or 220
+            end
+        end
+        s.minimapHide = nil
+        s.minimapPos = nil
+
         -- Migrate flat string custom phrases to per-phrase format
         if s.customPhrases and #s.customPhrases > 0 and type(s.customPhrases[1]) ==
             "string" then
@@ -700,7 +845,7 @@ f:SetScript("OnEvent", function(self, event, ...)
         local function DoSync()
             if synced then return end
             synced = true
-            f:UnregisterEvent("IGNORELIST_UPDATE")
+            f._pendingSync = nil
             SyncIgnoreList()
         end
 
@@ -740,6 +885,8 @@ f:SetScript("OnEvent", function(self, event, ...)
             -- Call the readiness check; it stays registered until it
             -- confirms the list is populated (or the safety timer fires).
             f._pendingSync()
+        else
+            ReconcileManualIgnoreChanges()
         end
 
     elseif (ThunderfuryAutoIgnoreDB.settings or {}).enabled then
@@ -1131,8 +1278,9 @@ tinsert(UISpecialFrames, "TFAAddPhrasePopup")
 
 -- Hook shift-click item linking so it pastes into our edit box
 hooksecurefunc("ChatEdit_InsertLink", function(link)
-    if addPhrasePopup:IsShown() and popupEditBox:HasFocus() then
-        popupEditBox:SetText(link)
+    local editBox = _G.TFAPopupEditBox
+    if addPhrasePopup:IsShown() and editBox and editBox:HasFocus() then
+        editBox:SetText(link)
     end
 end)
 
@@ -1308,9 +1456,10 @@ end)
 -- ===========================================================================
 SLASH_THUNDERFURYAUTOIGNORE1 = "/tfa"
 SlashCmdList["THUNDERFURYAUTOIGNORE"] = function(cmd)
-    cmd = (cmd or ""):lower()
-    local command, arg = cmd:match("^(%S+)%s*(.*)$")
-    command = command or cmd
+    local rawCmd = cmd or ""
+    local command, arg = rawCmd:match("^(%S+)%s*(.*)$")
+    command = (command or rawCmd):lower()
+    arg = arg or ""
 
     if command == "" then
         SyncIgnoreList(true)
