@@ -16,10 +16,15 @@ ThunderfuryAutoIgnoreDB.settings = ThunderfuryAutoIgnoreDB.settings or {
     enabled = true,
     ignoreHours = 1,
     customPhrases = {},
+    suppressGuildRecruitment = false,
+    suppressCraftingSales = false,
     minimapPos = 220,
     minimapHide = false
 }
 local debugMode = false
+local f
+local BuildGameIgnoreMap
+local CleanIgnoreList
 
 -- ---------------------------------------------------------------------------
 -- Locale-aware date/time formatting
@@ -74,6 +79,8 @@ local function ParseItemLink(text)
     return itemId, fullLink
 end
 
+local function TFA_Print(msg) print(msg) end
+
 local function SafeAddIgnore(name)
     local nameOnly = StripRealm(name)
     if C_FriendList and C_FriendList.AddIgnore then
@@ -92,12 +99,63 @@ local function SafeDelIgnore(name)
     end
 end
 
+local function GetIgnoreCount()
+    return C_FriendList and C_FriendList.GetNumIgnores and
+               C_FriendList.GetNumIgnores() or
+               (GetNumIgnores and GetNumIgnores()) or 0
+end
+
+local function GetIgnoreMax() return MAX_IGNORE or FRIENDS_LIST_IGNORE_MAX or 50 end
+
+local function FindOldestTemporaryInGame(gameMap)
+    local oldestName
+    local oldestTs
+    for dbName, data in pairs(ThunderfuryAutoIgnoreDB.ignoredPlayers or {}) do
+        if type(data) == "table" and not data.permanent then
+            local key = string.lower((dbName:match("^([^%-]+)") or dbName))
+            if gameMap[key] then
+                local ts = tonumber(data.timestamp) or 0
+                if not oldestName or ts < oldestTs then
+                    oldestName = dbName
+                    oldestTs = ts
+                end
+            end
+        end
+    end
+    return oldestName
+end
+
+local function EnsureIgnoreSpaceFIFO(forceOutput)
+    local current = GetIgnoreCount()
+    local maxIgnores = GetIgnoreMax()
+    if current < maxIgnores then return true end
+
+    -- Try normal cleanup first in case there are expired temporary entries.
+    CleanIgnoreList()
+    current = GetIgnoreCount()
+    if current < maxIgnores then return true end
+
+    -- FIFO eviction from tracked temporary entries that are currently in game list.
+    local gameMap = BuildGameIgnoreMap()
+    local victim = FindOldestTemporaryInGame(gameMap)
+    if not victim then return false end
+
+    local victimData = ThunderfuryAutoIgnoreDB.ignoredPlayers[victim] or {}
+    SafeDelIgnore(victim)
+    ThunderfuryAutoIgnoreDB.ignoredPlayers[victim] = nil
+    TFA_Print("|cffff8c00TFA:|r Ignore list full — evicted oldest ignore " ..
+                  victim .. " (ignored " ..
+                  FormatDateTime(victimData.timestamp or time()) .. ")",
+              forceOutput)
+    return true
+end
+
 local function IgnoreNameKey(name)
     local lower = string.lower(name or "")
     return lower:match("^([^%-]+)") or lower
 end
 
-local function BuildGameIgnoreMap()
+BuildGameIgnoreMap = function()
     local map = {}
     local numIgnored = C_FriendList and C_FriendList.GetNumIgnores and
                            C_FriendList.GetNumIgnores() or
@@ -166,8 +224,8 @@ local function ReconcileManualIgnoreChanges()
     f._lastGameIgnoreMap = current
 
     if imported > 0 or removed > 0 then
-        print("|cffff8c00TFA:|r Synced manual ignore changes (added " ..
-                  imported .. ", removed " .. removed .. ")")
+        TFA_Print("|cffff8c00TFA:|r Synced manual ignore changes (added " ..
+                      imported .. ", removed " .. removed .. ")")
     end
 end
 
@@ -182,7 +240,7 @@ font:SetTextColor(1, 1, 1)
 -- ---------------------------------------------------------------------------
 -- Main event frame
 -- ---------------------------------------------------------------------------
-local f = CreateFrame("Frame")
+f = CreateFrame("Frame")
 f:RegisterEvent("VARIABLES_LOADED")
 
 -- ---------------------------------------------------------------------------
@@ -283,46 +341,190 @@ end
 -- ---------------------------------------------------------------------------
 -- Shared spam detection  (built-in rules + user custom phrases)
 -- ---------------------------------------------------------------------------
-local function IsSpamMessage(msg)
+local function EscapeLuaPattern(text)
+    return (text:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1"))
+end
+
+local function ContainsWholeWord(lowerMsg, lowerPhrase)
+    local pattern = "%f[%w]" .. EscapeLuaPattern(lowerPhrase) .. "%f[%W]"
+    return lowerMsg:find(pattern) ~= nil
+end
+
+local function MatchSpamEntry(msg)
     local settings = ThunderfuryAutoIgnoreDB.settings or {}
-    if not settings.enabled then return false end
+    if not settings.enabled then return false, false end
     local lowerMsg = string.lower(msg)
 
     -- Custom phrases (per-entry contains / item-link matching)
     local phrases = settings.customPhrases or {}
     for _, entry in ipairs(phrases) do
         if type(entry) == "table" then
+            local action = entry.action == "suppress" and "suppress" or "ignore"
             if entry.itemId then
                 -- Match in-game item links by item ID
                 if msg:find("|Hitem:" .. entry.itemId .. ":") then
-                    return true
+                    return true, action == "ignore"
                 end
             elseif entry.text and entry.text ~= "" then
                 local lowerPhrase = string.lower(entry.text)
-                if entry.contains then
+                if entry.wholeWord then
+                    if ContainsWholeWord(lowerMsg, lowerPhrase) then
+                        return true, action == "ignore"
+                    end
+                elseif entry.contains then
                     if lowerMsg:find(lowerPhrase, 1, true) then
-                        return true
+                        return true, action == "ignore"
                     end
                 else
                     if lowerMsg == lowerPhrase then
-                        return true
+                        return true, action == "ignore"
                     end
                 end
             end
         elseif type(entry) == "string" and entry ~= "" then
             -- Legacy format fallback
             local lowerPhrase = string.lower(entry)
-            if lowerMsg:find(lowerPhrase, 1, true) then return true end
+            if lowerMsg:find(lowerPhrase, 1, true) then
+                return true, true
+            end
         end
+    end
+
+    return false, false
+end
+
+local function IsSpamMessage(msg)
+    local matched = MatchSpamEntry(msg)
+    return matched
+end
+
+local filterDefs = ThunderfuryAutoIgnoreFilters or {}
+
+local recruitmentKeywords = filterDefs.recruitmentKeywords or {}
+
+local recruitmentStrongPhrases = filterDefs.recruitmentStrongPhrases or {}
+
+local recruitmentExcludeKeywords = filterDefs.recruitmentExcludeKeywords or {}
+
+local function IsLikelyTradeChannel(...)
+    local candidates = {
+        select(3, ...), select(4, ...), select(8, ...), select(9, ...)
+    }
+    for _, value in ipairs(candidates) do
+        if type(value) == "string" then
+            local s = string.lower(value)
+            if s:find("trade", 1, true) then return true end
+        end
+    end
+
+    for i = 6, 9 do
+        local n = tonumber((select(i, ...)))
+        if n == 2 then return true end
     end
 
     return false
 end
 
+local function HasGreenGuildMarker(msg)
+    for rr, gg, bb in msg:gmatch("|cff(%x%x)(%x%x)(%x%x)<[^>]+>|r") do
+        local r = tonumber(rr, 16) or 0
+        local g = tonumber(gg, 16) or 0
+        local b = tonumber(bb, 16) or 0
+        if g >= 0x99 and g > r and g > b then return true end
+    end
+
+    for rr, gg, bb in msg:gmatch("|cff(%x%x)(%x%x)(%x%x)<[^>]+>") do
+        local r = tonumber(rr, 16) or 0
+        local g = tonumber(gg, 16) or 0
+        local b = tonumber(bb, 16) or 0
+        if g >= 0x99 and g > r and g > b then return true end
+    end
+
+    return false
+end
+
+local function HasAnyGuildMarker(msg)
+    if HasGreenGuildMarker(msg) then return true end
+    return msg:find("<[^>]+>") ~= nil
+end
+
+local function ContainsAnyKeyword(lowerMsg, keywords)
+    for _, kw in ipairs(keywords) do
+        if lowerMsg:find(kw, 1, true) then return true end
+    end
+    return false
+end
+
+local function CountKeywordMatches(lowerMsg, keywords)
+    local count = 0
+    for _, kw in ipairs(keywords) do
+        if lowerMsg:find(kw, 1, true) then count = count + 1 end
+    end
+    return count
+end
+
+local function IsGuildRecruitmentMessage(event, msg, ...)
+    if event ~= "CHAT_MSG_CHANNEL" and event ~= "CHAT_MSG_SAY" and event ~=
+        "CHAT_MSG_YELL" then return false end
+
+    local lowerMsg = string.lower(msg or "")
+    if ContainsAnyKeyword(lowerMsg, recruitmentExcludeKeywords) then
+        return false
+    end
+
+    local hasGreenMarker = HasGreenGuildMarker(msg)
+    local hasAnyMarker = HasAnyGuildMarker(msg)
+    local keywordHits = CountKeywordMatches(lowerMsg, recruitmentKeywords)
+    local strongHits = CountKeywordMatches(lowerMsg, recruitmentStrongPhrases)
+
+    return (hasGreenMarker and (keywordHits >= 1 or strongHits >= 1)) or
+               (hasAnyMarker and (keywordHits >= 2 or strongHits >= 1))
+end
+
+local craftingSaleKeywords = filterDefs.craftingSaleKeywords or {}
+local craftingContextKeywords = filterDefs.craftingContextKeywords or {}
+
+local function HasCraftingSignal(msg)
+    local lowerMsg = string.lower(msg or "")
+    if msg:find("|Htrade:") then return true end
+    if lowerMsg:find("%[enchanting%]") or lowerMsg:find("%[tailoring%]") or
+        lowerMsg:find("%[blacksmithing%]") or
+        lowerMsg:find("%[leatherworking%]") or lowerMsg:find("%[alchemy%]") or
+        lowerMsg:find("%[jewelcrafting%]") or lowerMsg:find("%[engineering%]") or
+        lowerMsg:find("%[inscription%]") or lowerMsg:find("%[enchant ") or
+        lowerMsg:find("%[enchanting:") or lowerMsg:find("%[tailoring:") or
+        lowerMsg:find("%[blacksmithing:") or lowerMsg:find("%[leatherworking:") or
+        lowerMsg:find("%[alchemy:") or lowerMsg:find("%[jewelcrafting:") or
+        lowerMsg:find("%[engineering:") or lowerMsg:find("%[inscription:") then
+        return true
+    end
+    if msg:find("|Hitem:") and lowerMsg:find("craft", 1, true) then
+        return true
+    end
+    if ContainsAnyKeyword(lowerMsg, craftingContextKeywords) then return true end
+    return false
+end
+
+local function IsCraftingSalesMessage(event, msg, ...)
+    if event ~= "CHAT_MSG_CHANNEL" and event ~= "CHAT_MSG_SAY" and event ~=
+        "CHAT_MSG_YELL" then return false end
+
+    if event == "CHAT_MSG_CHANNEL" and not IsLikelyTradeChannel(...) then
+        return false
+    end
+
+    local lowerMsg = string.lower(msg or "")
+    if not ContainsAnyKeyword(lowerMsg, craftingSaleKeywords) then
+        return false
+    end
+
+    return HasCraftingSignal(msg)
+end
+
 -- ---------------------------------------------------------------------------
 -- Clean expired ignores  (safe iteration - collects removals first)
 -- ---------------------------------------------------------------------------
-local function CleanIgnoreList()
+CleanIgnoreList = function()
     local now = time()
     local settings = ThunderfuryAutoIgnoreDB.settings or {}
     local hours = math.max(1, settings.ignoreHours or 1)
@@ -338,8 +540,8 @@ local function CleanIgnoreList()
         local ignoredAt = data and FormatDateTime(data.timestamp) or "?"
         SafeDelIgnore(name)
         ThunderfuryAutoIgnoreDB.ignoredPlayers[name] = nil
-        print("|cffff8c00TFA:|r Auto-unignored " .. name .. " (ignored " ..
-                  ignoredAt .. ", " .. hours .. "hr expiry)")
+        TFA_Print("|cffff8c00TFA:|r Auto-unignored " .. name .. " (ignored " ..
+                      ignoredAt .. ", " .. hours .. "hr expiry)")
     end
 end
 
@@ -476,7 +678,7 @@ end
 -- All operations are immediate (no staggering).  A ShowFriends() call
 -- at the end nudges the client to refresh the social data.
 -- ---------------------------------------------------------------------------
-local function SyncIgnoreList(silent)
+local function SyncIgnoreList(silent, forceOutput)
     -- 1.  Clean expired entries out of the addon DB
     CleanIgnoreList()
 
@@ -553,10 +755,15 @@ local function SyncIgnoreList(silent)
 
     -- 5.  Add only DB entries that are missing from the game ignore list
     local added = 0
+    local skippedFull = 0
     for name, _ in pairs(ThunderfuryAutoIgnoreDB.ignoredPlayers or {}) do
         if not IsAlreadyIgnored(name) then
-            SafeAddIgnore(name)
-            added = added + 1
+            if EnsureIgnoreSpaceFIFO(forceOutput) then
+                SafeAddIgnore(name)
+                added = added + 1
+            else
+                skippedFull = skippedFull + 1
+            end
         end
     end
 
@@ -576,19 +783,29 @@ local function SyncIgnoreList(silent)
     end
     if not silent then
         if imported > 0 and added > 0 then
-            print("|cffff8c00TFA:|r Imported " .. imported ..
-                      " game ignore(s) as permanent, added " .. added ..
-                      " DB ignore(s) to game — " .. total .. " total tracked")
+            TFA_Print("|cffff8c00TFA:|r Imported " .. imported ..
+                          " game ignore(s) as permanent, added " .. added ..
+                          " DB ignore(s) to game — " .. total ..
+                          " total tracked", forceOutput)
         elseif imported > 0 then
-            print("|cffff8c00TFA:|r Imported " .. imported ..
-                      " game ignore(s) as permanent — " .. total ..
-                      " total tracked")
+            TFA_Print("|cffff8c00TFA:|r Imported " .. imported ..
+                          " game ignore(s) as permanent — " .. total ..
+                          " total tracked", forceOutput)
         elseif added > 0 then
-            print("|cffff8c00TFA:|r Added " .. added ..
-                      " DB ignore(s) to game — " .. total .. " total tracked")
+            TFA_Print("|cffff8c00TFA:|r Added " .. added ..
+                          " DB ignore(s) to game — " .. total ..
+                          " total tracked", forceOutput)
         elseif total > 0 then
-            print("|cffff8c00TFA:|r Ignore list in sync — " .. total ..
-                      " player(s) tracked")
+            TFA_Print("|cffff8c00TFA:|r Ignore list in sync — " .. total ..
+                          " player(s) tracked", forceOutput)
+        end
+
+        if skippedFull > 0 then
+            TFA_Print("|cffff8c00TFA:|r Ignore list full — skipped " ..
+                          skippedFull .. " DB entr" ..
+                          (skippedFull == 1 and "y" or "ies") ..
+                          " (no temporary FIFO candidate available)",
+                      forceOutput)
         end
     end
 end
@@ -699,8 +916,14 @@ end
 -- ---------------------------------------------------------------------------
 local function ChatFilter(self, event, msg, ...)
     local isSpam = IsSpamMessage(msg)
-    if isSpam and debugMode then return false end
-    return isSpam
+    local settings = ThunderfuryAutoIgnoreDB.settings or {}
+    local isGuildRecruit = settings.suppressGuildRecruitment and
+                               IsGuildRecruitmentMessage(event, msg, ...)
+    local isCraftingSales = settings.suppressCraftingSales and
+                                IsCraftingSalesMessage(event, msg, ...)
+    local shouldSuppress = isSpam or isGuildRecruit or isCraftingSales
+    if shouldSuppress and debugMode then return false end
+    return shouldSuppress
 end
 
 -- ---------------------------------------------------------------------------
@@ -714,7 +937,9 @@ f:SetScript("OnEvent", function(self, event, ...)
             ThunderfuryAutoIgnoreDB.settings = {
                 enabled = true,
                 ignoreHours = 1,
-                customPhrases = {}
+                customPhrases = {},
+                suppressGuildRecruitment = false,
+                suppressCraftingSales = false
             }
             s = ThunderfuryAutoIgnoreDB.settings
         end
@@ -725,6 +950,12 @@ f:SetScript("OnEvent", function(self, event, ...)
         end
         if s.ignoreHours == nil then s.ignoreHours = 1 end
         if s.customPhrases == nil then s.customPhrases = {} end
+        if s.suppressGuildRecruitment == nil then
+            s.suppressGuildRecruitment = false
+        end
+        if s.suppressCraftingSales == nil then
+            s.suppressCraftingSales = false
+        end
 
         -- Migrate old minimap keys to nested minimap table
         if type(s.minimap) ~= "table" then
@@ -750,10 +981,20 @@ f:SetScript("OnEvent", function(self, event, ...)
             for _, phrase in ipairs(s.customPhrases) do
                 table.insert(newPhrases, {
                     text = phrase,
-                    contains = s.useContains and true or false
+                    contains = s.useContains and true or false,
+                    wholeWord = false,
+                    action = "ignore"
                 })
             end
             s.customPhrases = newPhrases
+        end
+
+        -- Ensure all phrase entries have a valid action
+        for _, e in ipairs(s.customPhrases) do
+            if type(e) == "table" then
+                e.action = e.action == "suppress" and "suppress" or "ignore"
+                if e.wholeWord == nil then e.wholeWord = false end
+            end
         end
 
         -- Seed default Thunderfury entries if customPhrases is empty
@@ -781,7 +1022,9 @@ f:SetScript("OnEvent", function(self, event, ...)
             if not HasThunderfuryPhrase() then
                 table.insert(s.customPhrases, 1, {
                     text = "Thunderfury, Blessed Blade of the Windseeker",
-                    contains = false
+                    contains = false,
+                    wholeWord = false,
+                    action = "ignore"
                 })
             end
         end
@@ -795,6 +1038,7 @@ f:SetScript("OnEvent", function(self, event, ...)
                         "Thunderfury, Blessed Blade of the Windseeker",
                     itemId = "19019",
                     itemLink = tfLink,
+                    action = "ignore",
                     displayName = tfName or
                         "Thunderfury, Blessed Blade of the Windseeker"
                 })
@@ -827,6 +1071,8 @@ f:SetScript("OnEvent", function(self, event, ...)
         -- Clean up old settings keys
         s.thunderfury = nil
         s.itemLink = nil
+        s.suppressMessages = nil
+        s.guildRecruitStrictness = nil
 
         f:RegisterEvent("PLAYER_ENTERING_WORLD")
         f:UnregisterEvent("VARIABLES_LOADED")
@@ -891,7 +1137,8 @@ f:SetScript("OnEvent", function(self, event, ...)
 
     elseif (ThunderfuryAutoIgnoreDB.settings or {}).enabled then
         local msg, author = ...
-        if IsSpamMessage(msg) then
+        local isSpam, shouldIgnorePlayer = MatchSpamEntry(msg)
+        if isSpam and shouldIgnorePlayer then
             local playerName = author
             local guid = select(12, ...) or ""
             if guid and guid ~= "" then
@@ -921,12 +1168,21 @@ f:SetScript("OnEvent", function(self, event, ...)
             end
 
             if not existingName then
-                SafeAddIgnore(playerName)
-                ThunderfuryAutoIgnoreDB.ignoredPlayers[playerName] = {
-                    timestamp = time()
-                }
-                print("|cffff8c00TFA:|r Ignored " .. playerName .. " for spam")
-                if ignoreFrame:IsShown() then UpdateIgnoreList() end
+                if EnsureIgnoreSpaceFIFO(false) then
+                    SafeAddIgnore(playerName)
+                    ThunderfuryAutoIgnoreDB.ignoredPlayers[playerName] = {
+                        timestamp = time()
+                    }
+                    TFA_Print("|cffff8c00TFA:|r Ignored " .. playerName ..
+                                  " for spam")
+                    if ignoreFrame:IsShown() then
+                        UpdateIgnoreList()
+                    end
+                else
+                    TFA_Print(
+                        "|cffff8c00TFA:|r Ignore list full; no temporary " ..
+                            "entry available for FIFO eviction")
+                end
             end
         end
     end
@@ -945,7 +1201,7 @@ StaticPopupDialogs["THUNDERFURYAUTOIGNORE_CONFIRM"] = {
         SafeDelIgnore(data.name)
         ThunderfuryAutoIgnoreDB.ignoredPlayers[data.name] = nil
         UpdateIgnoreList()
-        print("|cffff8c00TFA:|r Unignored " .. data.name)
+        TFA_Print("|cffff8c00TFA:|r Unignored " .. data.name)
     end,
     OnCancel = function(_, data)
         -- Button 2: Toggle Permanent
@@ -953,7 +1209,7 @@ StaticPopupDialogs["THUNDERFURYAUTOIGNORE_CONFIRM"] = {
         if entry then
             entry.permanent = not entry.permanent
             local state = entry.permanent and "permanent" or "temporary"
-            print("|cffff8c00TFA:|r " .. data.name .. " is now " .. state)
+            TFA_Print("|cffff8c00TFA:|r " .. data.name .. " is now " .. state)
             UpdateIgnoreList()
         end
     end,
@@ -1003,6 +1259,22 @@ local subtitle = optionsPanel:CreateFontString(nil, "ARTWORK",
 subtitle:SetPoint("TOPLEFT", titleText, "BOTTOMLEFT", 0, -8)
 subtitle:SetText("Configure spam detection and auto-ignore behavior")
 
+local function AttachOptionTooltip(widget, title, lines)
+    widget:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:AddLine(title, 1, 0.8, 0)
+        if type(lines) == "table" then
+            for _, line in ipairs(lines) do
+                GameTooltip:AddLine(line, 1, 1, 1, true)
+            end
+        elseif type(lines) == "string" and lines ~= "" then
+            GameTooltip:AddLine(lines, 1, 1, 1, true)
+        end
+        GameTooltip:Show()
+    end)
+    widget:SetScript("OnLeave", function() GameTooltip:Hide() end)
+end
+
 -- Enable overall ---------------------------------------------------------
 local enableCheck = CreateFrame("CheckButton", nil, optionsPanel,
                                 "InterfaceOptionsCheckButtonTemplate")
@@ -1014,15 +1286,56 @@ enableCheck.label:SetText("Enable Auto-Ignore")
 enableCheck:SetScript("OnClick", function(self)
     ThunderfuryAutoIgnoreDB.settings.enabled = self:GetChecked()
     RegisterEvents()
-    print("|cffff8c00TFA:|r " ..
-              (ThunderfuryAutoIgnoreDB.settings.enabled and "Enabled" or
-                  "Disabled"))
+    TFA_Print("|cffff8c00TFA:|r " ..
+                  (ThunderfuryAutoIgnoreDB.settings.enabled and "Enabled" or
+                      "Disabled"))
 end)
+AttachOptionTooltip(enableCheck, "Enable Auto-Ignore", {
+    "Turns all automatic filtering/ignoring on or off.",
+    "When disabled, TFA does not auto-suppress messages."
+})
+
+local suppressGuildRecruitCheck = CreateFrame("CheckButton", nil, optionsPanel,
+                                              "InterfaceOptionsCheckButtonTemplate")
+suppressGuildRecruitCheck:SetPoint("TOPLEFT", enableCheck, "BOTTOMLEFT", 0, -4)
+suppressGuildRecruitCheck.label = suppressGuildRecruitCheck:CreateFontString(
+                                      nil, "OVERLAY", "GameFontNormal")
+suppressGuildRecruitCheck.label:SetPoint("LEFT", suppressGuildRecruitCheck,
+                                         "RIGHT", 5, 0)
+suppressGuildRecruitCheck.label:SetText(
+    "Suppress guild recruitment (Trade/Say/Yell)")
+suppressGuildRecruitCheck:SetScript("OnClick", function(self)
+    ThunderfuryAutoIgnoreDB.settings.suppressGuildRecruitment =
+        self:GetChecked() and true or false
+end)
+AttachOptionTooltip(suppressGuildRecruitCheck, "Suppress Guild Recruitment", {
+    "Suppresses likely guild recruitment ads in Trade/Say/Yell.",
+    "Uses guild-marker and recruitment-phrase heuristics."
+})
+
+local suppressCraftingSalesCheck = CreateFrame("CheckButton", nil, optionsPanel,
+                                               "InterfaceOptionsCheckButtonTemplate")
+suppressCraftingSalesCheck:SetPoint("TOPLEFT", suppressGuildRecruitCheck,
+                                    "BOTTOMLEFT", 0, -4)
+suppressCraftingSalesCheck.label = suppressCraftingSalesCheck:CreateFontString(
+                                       nil, "OVERLAY", "GameFontNormal")
+suppressCraftingSalesCheck.label:SetPoint("LEFT", suppressCraftingSalesCheck,
+                                          "RIGHT", 5, 0)
+suppressCraftingSalesCheck.label:SetText(
+    "Suppress crafting sales (profession/enchant ads)")
+suppressCraftingSalesCheck:SetScript("OnClick", function(self)
+    ThunderfuryAutoIgnoreDB.settings.suppressCraftingSales =
+        self:GetChecked() and true or false
+end)
+AttachOptionTooltip(suppressCraftingSalesCheck, "Suppress Crafting Sales", {
+    "Suppresses crafting/enchant sale advertisements.",
+    "Targets profession links/tags and selling language."
+})
 
 -- Ignore duration (dropdown 1-24 hours) -----------------------------------
 local hoursLabel = optionsPanel:CreateFontString(nil, "OVERLAY",
                                                  "GameFontNormal")
-hoursLabel:SetPoint("TOPLEFT", enableCheck, "BOTTOMLEFT", 4, -18)
+hoursLabel:SetPoint("TOPLEFT", suppressCraftingSalesCheck, "BOTTOMLEFT", 4, -14)
 hoursLabel:SetText("Hours before auto-unignore:")
 
 local hoursDropdown = CreateFrame("Frame", "TFAHoursDropdown", optionsPanel,
@@ -1046,6 +1359,10 @@ end
 UIDropDownMenu_Initialize(hoursDropdown, HoursDropdown_Initialize)
 UIDropDownMenu_SetSelectedValue(hoursDropdown, ThunderfuryAutoIgnoreDB.settings
                                     .ignoreHours or 1)
+AttachOptionTooltip(hoursDropdown, "Auto-Unignore Duration", {
+    "How long temporary ignores stay before TFA removes them.",
+    "Permanent ignores are never auto-removed."
+})
 
 -- ---------------------------------------------------------------------------
 -- Custom Phrases — list + Add popup
@@ -1128,6 +1445,8 @@ local function ReleaseAllPhraseLines()
     wipe(activePhraseLines)
 end
 
+local OpenPhraseEditor
+
 local function RefreshPhraseList()
     ReleaseAllPhraseLines()
     local phrases = ThunderfuryAutoIgnoreDB.settings.customPhrases or {}
@@ -1136,6 +1455,9 @@ local function RefreshPhraseList()
         local line = AcquirePhraseLine()
         line:SetPoint("TOPLEFT", 0, yOffset)
         if type(entry) == "table" then
+            local action = entry.action == "suppress" and "suppress" or "ignore"
+            local actionTag = action == "ignore" and "|cffff6666[Ignore]|r " or
+                                  "|cff66ccff[Suppress]|r "
             if entry.itemId then
                 -- Try to get the real item link from the game for display
                 local displayLink = entry.itemLink
@@ -1144,7 +1466,8 @@ local function RefreshPhraseList()
                     displayLink = link
                 end
                 if displayLink then
-                    line.text:SetText("|cff00ccff[Item]|r " .. displayLink)
+                    line.text:SetText(actionTag .. "|cff00ccff[Item]|r " ..
+                                          displayLink)
                     -- Tooltip on hover
                     local storedLink = displayLink
                     line:SetScript("OnEnter", function(self)
@@ -1156,23 +1479,34 @@ local function RefreshPhraseList()
                         GameTooltip:Hide()
                     end)
                 else
-                    line.text:SetText("|cff00ccff[Item:" .. entry.itemId ..
-                                          "]|r " ..
+                    line.text:SetText(actionTag .. "|cff00ccff[Item:" ..
+                                          entry.itemId .. "]|r " ..
                                           (entry.displayName or "loading..."))
                 end
             else
-                local tag = entry.contains and "|cff00ff00[Contains]|r " or
-                                "|cffffcc00[Exact]|r "
-                line.text:SetText(tag .. (entry.text or ""))
+                local tag
+                if entry.wholeWord then
+                    tag = "|cff66ff66[Word]|r "
+                elseif entry.contains then
+                    tag = "|cff00ff00[Contains]|r "
+                else
+                    tag = "|cffffcc00[Exact]|r "
+                end
+                line.text:SetText(actionTag .. tag .. (entry.text or ""))
             end
         else
             line.text:SetText(tostring(entry))
         end
         local idx = i
+        line:SetScript("OnMouseUp", function(self, button)
+            if button == "LeftButton" and OpenPhraseEditor then
+                OpenPhraseEditor(idx, entry)
+            end
+        end)
         line.removeBtn:SetScript("OnClick", function()
             table.remove(ThunderfuryAutoIgnoreDB.settings.customPhrases, idx)
             RefreshPhraseList()
-            print("|cffff8c00TFA:|r Removed custom phrase")
+            TFA_Print("|cffff8c00TFA:|r Removed custom phrase")
         end)
         yOffset = yOffset - 20
     end
@@ -1207,7 +1541,8 @@ addTFBtn:SetScript("OnClick", function()
     if not hasPhrase then
         table.insert(phrases, {
             text = "Thunderfury, Blessed Blade of the Windseeker",
-            contains = false
+            contains = false,
+            action = "ignore"
         })
         added = added + 1
     end
@@ -1217,6 +1552,7 @@ addTFBtn:SetScript("OnClick", function()
             text = tfName or "Thunderfury, Blessed Blade of the Windseeker",
             itemId = "19019",
             itemLink = tfLink,
+            action = "ignore",
             displayName = tfName or
                 "Thunderfury, Blessed Blade of the Windseeker"
         }
@@ -1242,10 +1578,10 @@ addTFBtn:SetScript("OnClick", function()
     end
     if added > 0 then
         RefreshPhraseList()
-        print("|cffff8c00TFA:|r Added Thunderfury filters (" .. added ..
-                  " entries)")
+        TFA_Print("|cffff8c00TFA:|r Added Thunderfury filters (" .. added ..
+                      " entries)")
     else
-        print("|cffff8c00TFA:|r Thunderfury filters already exist")
+        TFA_Print("|cffff8c00TFA:|r Thunderfury filters already exist")
     end
 end)
 
@@ -1254,7 +1590,7 @@ end)
 -- ---------------------------------------------------------------------------
 local addPhrasePopup = CreateFrame("Frame", "TFAAddPhrasePopup", UIParent,
                                    "BackdropTemplate")
-addPhrasePopup:SetSize(340, 170)
+addPhrasePopup:SetSize(340, 220)
 addPhrasePopup:SetPoint("CENTER")
 addPhrasePopup:SetFrameStrata("DIALOG")
 addPhrasePopup:SetClampedToScreen(true)
@@ -1289,6 +1625,16 @@ local popupTitle = addPhrasePopup:CreateFontString(nil, "OVERLAY",
                                                    "GameFontNormal")
 popupTitle:SetPoint("TOP", 0, -12)
 popupTitle:SetText("Add Custom Phrase")
+
+local phraseEditorState = {index = nil, entry = nil}
+
+local function SaveCustomPhraseEntry(entry, editIndex)
+    if editIndex and ThunderfuryAutoIgnoreDB.settings.customPhrases[editIndex] then
+        ThunderfuryAutoIgnoreDB.settings.customPhrases[editIndex] = entry
+    else
+        table.insert(ThunderfuryAutoIgnoreDB.settings.customPhrases, entry)
+    end
+end
 
 -- Popup close button
 local popupClose = CreateFrame("Button", nil, addPhrasePopup,
@@ -1333,6 +1679,45 @@ popupContainsCheck.label = popupContainsCheck:CreateFontString(nil, "OVERLAY",
                                                                "GameFontNormal")
 popupContainsCheck.label:SetPoint("LEFT", popupContainsCheck, "RIGHT", 5, 0)
 popupContainsCheck.label:SetText("Use 'contains' matching (for text phrases)")
+AttachOptionTooltip(popupContainsCheck, "Contains Match", {
+    "Matches when the phrase appears anywhere in the message.",
+    "Example: LF matches LFG/LFM."
+})
+
+local popupWholeWordCheck = CreateFrame("CheckButton", nil, addPhrasePopup,
+                                        "InterfaceOptionsCheckButtonTemplate")
+popupWholeWordCheck:SetPoint("TOPLEFT", popupContainsCheck, "BOTTOMLEFT", 0, -2)
+popupWholeWordCheck:SetChecked(false)
+popupWholeWordCheck.label = popupWholeWordCheck:CreateFontString(nil, "OVERLAY",
+                                                                 "GameFontNormal")
+popupWholeWordCheck.label:SetPoint("LEFT", popupWholeWordCheck, "RIGHT", 5, 0)
+popupWholeWordCheck.label:SetText("Match whole word only")
+AttachOptionTooltip(popupWholeWordCheck, "Whole Word Match", {
+    "Matches only standalone words, not substrings.",
+    "Example: anal matches 'anal' but not 'analogy'."
+})
+
+popupWholeWordCheck:SetScript("OnClick", function(self)
+    if self:GetChecked() then popupContainsCheck:SetChecked(true) end
+end)
+
+popupContainsCheck:SetScript("OnClick", function(self)
+    if not self:GetChecked() then popupWholeWordCheck:SetChecked(false) end
+end)
+
+local popupIgnoreCheck = CreateFrame("CheckButton", nil, addPhrasePopup,
+                                     "InterfaceOptionsCheckButtonTemplate")
+popupIgnoreCheck:SetPoint("TOPLEFT", popupWholeWordCheck, "BOTTOMLEFT", 0, -4)
+popupIgnoreCheck:SetChecked(true)
+popupIgnoreCheck.label = popupIgnoreCheck:CreateFontString(nil, "OVERLAY",
+                                                           "GameFontNormal")
+popupIgnoreCheck.label:SetPoint("LEFT", popupIgnoreCheck, "RIGHT", 5, 0)
+popupIgnoreCheck.label:SetText(
+    "Ignore matching player (otherwise suppress only)")
+AttachOptionTooltip(popupIgnoreCheck, "Action", {
+    "Checked: suppress message and ignore sender.",
+    "Unchecked: suppress message only."
+})
 
 -- Cancel button (anchored to bottom-right of popup)
 local popupCancelBtn = CreateFrame("Button", nil, addPhrasePopup,
@@ -1355,7 +1740,9 @@ popupOkBtn:SetScript("OnClick", function()
     if not text or text == "" then return end
 
     local entry
+    local editIndex = phraseEditorState.index
     local itemId, fullLink = ParseItemLink(text)
+    local action = popupIgnoreCheck:GetChecked() and "ignore" or "suppress"
     if itemId then
         -- Detected an item link — validate it exists on the server
         local itemName, itemLink = GetItemInfo(tonumber(itemId))
@@ -1365,16 +1752,17 @@ popupOkBtn:SetScript("OnClick", function()
                 text = itemName,
                 itemId = itemId,
                 itemLink = itemLink,
+                action = action,
                 displayName = itemName
             }
-            table.insert(ThunderfuryAutoIgnoreDB.settings.customPhrases, entry)
+            SaveCustomPhraseEntry(entry, editIndex)
             RefreshPhraseList()
             addPhrasePopup:Hide()
-            print("|cffff8c00TFA:|r Added item link filter: " .. itemLink)
+            TFA_Print("|cffff8c00TFA:|r Added item link filter: " .. itemLink)
         else
             -- Item not cached yet — request it and wait for GET_ITEM_INFO_RECEIVED
-            print("|cffff8c00TFA:|r Querying server for item " .. itemId ..
-                      "...")
+            TFA_Print("|cffff8c00TFA:|r Querying server for item " .. itemId ..
+                          "...")
             local waitFrame = CreateFrame("Frame")
             waitFrame:RegisterEvent("GET_ITEM_INFO_RECEIVED")
             local timer
@@ -1391,38 +1779,41 @@ popupOkBtn:SetScript("OnClick", function()
                             text = name2,
                             itemId = itemId,
                             itemLink = link2,
+                            action = action,
                             displayName = name2
                         }
-                        table.insert(ThunderfuryAutoIgnoreDB.settings
-                                         .customPhrases, entry)
+                        SaveCustomPhraseEntry(entry, editIndex)
                         RefreshPhraseList()
                         addPhrasePopup:Hide()
-                        print("|cffff8c00TFA:|r Added item link filter: " ..
-                                  link2)
+                        TFA_Print("|cffff8c00TFA:|r Added item link filter: " ..
+                                      link2)
                     else
-                        print("|cffff8c00TFA:|r Item " .. itemId ..
-                                  " not found on server.")
+                        TFA_Print("|cffff8c00TFA:|r Item " .. itemId ..
+                                      " not found on server.")
                     end
                 end
             end)
             -- Timeout after 5 seconds
             timer = C_Timer.NewTimer(5, function()
                 waitFrame:UnregisterAllEvents()
-                print("|cffff8c00TFA:|r Timed out looking up item " .. itemId ..
-                          ". It may not exist.")
+                TFA_Print("|cffff8c00TFA:|r Timed out looking up item " ..
+                              itemId .. ". It may not exist.")
             end)
         end
     else
         -- Plain text phrase
         entry = {
             text = text,
-            contains = popupContainsCheck:GetChecked() and true or false
+            contains = popupContainsCheck:GetChecked() and true or false,
+            wholeWord = popupWholeWordCheck:GetChecked() and true or false,
+            action = action
         }
-        table.insert(ThunderfuryAutoIgnoreDB.settings.customPhrases, entry)
+        SaveCustomPhraseEntry(entry, editIndex)
         RefreshPhraseList()
         addPhrasePopup:Hide()
-        local mode = entry.contains and "contains" or "exact"
-        print("|cffff8c00TFA:|r Added custom phrase (" .. mode .. " match)")
+        local mode = entry.wholeWord and "whole word" or
+                         (entry.contains and "contains" or "exact")
+        TFA_Print("|cffff8c00TFA:|r Added custom phrase (" .. mode .. " match)")
     end
 end)
 
@@ -1431,13 +1822,47 @@ popupEditBox:SetScript("OnEnterPressed", function() popupOkBtn:Click() end)
 
 -- Reset popup state when shown
 addPhrasePopup:SetScript("OnShow", function()
-    popupEditBox:SetText("")
-    popupContainsCheck:SetChecked(true)
+    local editEntry = phraseEditorState.entry
+    if editEntry then
+        popupTitle:SetText("Edit Blocked Phrase")
+        popupOkBtn:SetText("Save")
+        if editEntry.itemId then
+            popupEditBox:SetText(editEntry.itemLink or editEntry.text or "")
+        else
+            popupEditBox:SetText(editEntry.text or "")
+        end
+        popupContainsCheck:SetChecked(editEntry.contains and true or false)
+        popupWholeWordCheck:SetChecked(editEntry.wholeWord and true or false)
+        popupIgnoreCheck:SetChecked((editEntry.action ~= "suppress") and true or
+                                        false)
+    else
+        popupTitle:SetText("Add Custom Phrase")
+        popupOkBtn:SetText("Add")
+        popupEditBox:SetText("")
+        popupContainsCheck:SetChecked(true)
+        popupWholeWordCheck:SetChecked(false)
+        popupIgnoreCheck:SetChecked(true)
+    end
     popupEditBox:SetFocus()
 end)
 
+addPhrasePopup:SetScript("OnHide", function()
+    phraseEditorState.index = nil
+    phraseEditorState.entry = nil
+end)
+
 -- Wire up the Add Phrase button to open the popup
-addPhraseBtn:SetScript("OnClick", function() addPhrasePopup:Show() end)
+OpenPhraseEditor = function(index, entry)
+    phraseEditorState.index = index
+    phraseEditorState.entry = entry
+    addPhrasePopup:Show()
+end
+
+addPhraseBtn:SetScript("OnClick", function()
+    phraseEditorState.index = nil
+    phraseEditorState.entry = nil
+    addPhrasePopup:Show()
+end)
 
 -- ---------------------------------------------------------------------------
 -- Refresh every control when the panel is shown
@@ -1445,6 +1870,10 @@ addPhraseBtn:SetScript("OnClick", function() addPhrasePopup:Show() end)
 optionsPanel:SetScript("OnShow", function()
     local s = ThunderfuryAutoIgnoreDB.settings or {}
     enableCheck:SetChecked(s.enabled)
+    suppressGuildRecruitCheck:SetChecked(
+        s.suppressGuildRecruitment and true or false)
+    suppressCraftingSalesCheck:SetChecked(
+        s.suppressCraftingSales and true or false)
     UIDropDownMenu_SetSelectedValue(hoursDropdown, s.ignoreHours or 1)
     UIDropDownMenu_SetText(hoursDropdown, tostring(s.ignoreHours or 1))
     -- Refresh the phrase list display
@@ -1498,18 +1927,23 @@ SlashCmdList["THUNDERFURYAUTOIGNORE"] = function(cmd)
             end
         end
         if not exists then
-            SafeAddIgnore(playerName)
-            ThunderfuryAutoIgnoreDB.ignoredPlayers[playerName] = {
-                timestamp = time()
-            }
-            print("|cffff8c00TFA:|r Added " .. playerName)
-            if ignoreFrame:IsShown() then UpdateIgnoreList() end
+            if EnsureIgnoreSpaceFIFO(true) then
+                SafeAddIgnore(playerName)
+                ThunderfuryAutoIgnoreDB.ignoredPlayers[playerName] = {
+                    timestamp = time()
+                }
+                print("|cffff8c00TFA:|r Added " .. playerName)
+                if ignoreFrame:IsShown() then UpdateIgnoreList() end
+            else
+                print("|cffff8c00TFA:|r Ignore list full; no temporary " ..
+                          "entry available for FIFO eviction")
+            end
         else
             print("|cffff8c00TFA:|r " .. exists .. " already ignored")
         end
 
     elseif command == "sync" then
-        SyncIgnoreList()
+        SyncIgnoreList(false, true)
 
     elseif command == "verify" then
         StartVerify()
